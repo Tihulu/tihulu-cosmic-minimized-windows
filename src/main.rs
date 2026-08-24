@@ -2,7 +2,6 @@
 
 mod app;
 mod config;
-mod media_client;
 mod wayland;
 
 fn main() -> cosmic::iced::Result {
