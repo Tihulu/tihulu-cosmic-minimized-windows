@@ -82,7 +82,7 @@ impl MinimizedWindows {
         let (app_label, icon) = self.app_visuals(&info.app_id);
         let title = info.title.trim();
         let label = if title.is_empty() || title == app_label {
-            app_label.clone()
+            app_label
         } else {
             format!("{title}\n{app_label}")
         };
