@@ -50,6 +50,10 @@ pub fn save_mode(mode: RunMode) -> io::Result<()> {
         return Ok(());
     };
     fs::create_dir_all(&dir)?;
-    let value = if mode.is_safe() { "safe\n" } else { "enhanced\n" };
+    let value = if mode.is_safe() {
+        "safe\n"
+    } else {
+        "enhanced\n"
+    };
     fs::write(dir.join("mode"), value)
 }

@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
-    process::Stdio,
-    time::Duration,
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Stdio, time::Duration};
 
 use serde_json::{Map, Value, json};
 use tokio::{
@@ -79,10 +73,7 @@ fn self_fd_count() -> usize {
 
 async fn run_program(program: &str, args: &[String]) -> Option<Vec<u8>> {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    command.args(args).stdin(Stdio::null()).kill_on_drop(true);
     let output = timeout(PROCESS_TIMEOUT, command.output())
         .await
         .ok()?
@@ -316,11 +307,7 @@ fn audio_score(
     score
 }
 
-async fn audio_candidates(
-    app_id: &str,
-    app_label: &str,
-    media_title: &str,
-) -> Vec<AudioCandidate> {
+async fn audio_candidates(app_id: &str, app_label: &str, media_title: &str) -> Vec<AudioCandidate> {
     let Some(output) = run_program(
         "pactl",
         &[
@@ -398,7 +385,10 @@ async fn best_snapshot(
         if score == 0 {
             continue;
         }
-        if let Some(audio) = audio_candidates(app_id, app_label, &snapshot.title).await.first() {
+        if let Some(audio) = audio_candidates(app_id, app_label, &snapshot.title)
+            .await
+            .first()
+        {
             snapshot.volume = audio.volume;
             snapshot.muted = audio.muted;
         }
@@ -507,7 +497,11 @@ async fn command_and_refresh(request: &Value, action: &str) -> Value {
                 }
                 any
             } else {
-                let delta = if action == "volume_up" { "0.05+" } else { "0.05-" };
+                let delta = if action == "volume_up" {
+                    "0.05+"
+                } else {
+                    "0.05-"
+                };
                 run_status(
                     "playerctl",
                     &[
@@ -568,8 +562,9 @@ async fn handle_request(request: Value) -> Value {
                 None => json!({"ok": false, "error": "no matching media player"}),
             }
         }
-        "toggle_playback" | "next" | "previous" | "volume_up" | "volume_down"
-        | "toggle_mute" => command_and_refresh(&request, command).await,
+        "toggle_playback" | "next" | "previous" | "volume_up" | "volume_down" | "toggle_mute" => {
+            command_and_refresh(&request, command).await
+        }
         _ => json!({"ok": false, "error": "unknown command"}),
     }
 }

@@ -9,7 +9,10 @@ use std::{
 };
 
 use cctk::{
-    sctk::{self, registry::{ProvidesRegistryState, RegistryState}},
+    sctk::{
+        self,
+        registry::{ProvidesRegistryState, RegistryState},
+    },
     toplevel_info::{ToplevelInfoHandler, ToplevelInfoState},
     wayland_client::{
         Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
@@ -298,8 +301,7 @@ fn capture_once(
 
     let fd = rustix::fs::memfd_create(c"tihulu-preview-probe", rustix::fs::MemfdFlags::CLOEXEC)
         .map_err(|error| format!("memfd_create failed: {error}"))?;
-    rustix::fs::ftruncate(&fd, byte_len)
-        .map_err(|error| format!("ftruncate failed: {error}"))?;
+    rustix::fs::ftruncate(&fd, byte_len).map_err(|error| format!("ftruncate failed: {error}"))?;
 
     let pool = shm.create_pool(fd.as_fd(), pool_len, &qh, ());
     let buffer = pool.create_buffer(
@@ -327,9 +329,7 @@ fn capture_once(
         .map_err(|error| format!("Wayland capture flush failed: {error}"))?;
 
     let frame_result = roundtrip_until(queue, state, |state| {
-        state.capture.frame_ready
-            || state.capture.frame_failed
-            || state.capture.session_stopped
+        state.capture.frame_ready || state.capture.frame_failed || state.capture.session_stopped
     });
 
     frame.destroy();
@@ -354,17 +354,23 @@ struct ProcMetrics {
 }
 
 fn pid_by_comm(name: &str) -> Option<u32> {
-    for entry in fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
-        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
         if comm.trim() == name {
             return Some(pid);
         }
     }
     None
 }
-
 fn proc_metrics(pid: u32) -> ProcMetrics {
     let fd = fs::read_dir(format!("/proc/{pid}/fd"))
         .map(|entries| entries.filter_map(Result::ok).count())
@@ -442,7 +448,9 @@ fn main() -> Result<(), String> {
 
     let copy_manager = globals
         .bind::<ExtImageCopyCaptureManagerV1, _, _>(&qh, 1..=1, ())
-        .map_err(|_| "Compositor does not advertise ext_image_copy_capture_manager_v1".to_owned())?;
+        .map_err(|_| {
+            "Compositor does not advertise ext_image_copy_capture_manager_v1".to_owned()
+        })?;
     let source_manager = globals
         .bind::<ExtForeignToplevelImageCaptureSourceManagerV1, _, _>(&qh, 1..=1, ())
         .map_err(|_| {
@@ -495,8 +503,12 @@ fn main() -> Result<(), String> {
         let comp = proc_metrics(cosmic_pid);
         let probe = proc_metrics(probe_pid);
         let success = result.is_ok();
-        writeln!(csv, "{index},{success},{},{},{}", comp.fd, comp.rss_kb, probe.fd)
-            .map_err(|error| format!("Could not write probe CSV: {error}"))?;
+        writeln!(
+            csv,
+            "{index},{success},{},{},{}",
+            comp.fd, comp.rss_kb, probe.fd
+        )
+        .map_err(|error| format!("Could not write probe CSV: {error}"))?;
         csv.flush().ok();
 
         if comp.fd > previous_fd {
@@ -539,9 +551,14 @@ fn main() -> Result<(), String> {
 
     let final_metrics = proc_metrics(cosmic_pid);
     let final_growth = final_metrics.fd.saturating_sub(baseline.fd);
-    eprintln!("Probe completed {completed} capture(s). CSV: {}", csv_path.display());
+    eprintln!(
+        "Probe completed {completed} capture(s). CSV: {}",
+        csv_path.display()
+    );
     if final_growth >= FD_GROWTH_LIMIT {
-        eprintln!("RESULT: UNSAFE / suspicious FD growth (+{final_growth}). Keep Safe Mode enabled.");
+        eprintln!(
+            "RESULT: UNSAFE / suspicious FD growth (+{final_growth}). Keep Safe Mode enabled."
+        );
     } else {
         eprintln!(
             "RESULT: no large monotonic FD growth observed in this run (+{final_growth}). Repeat before enabling previews by default."

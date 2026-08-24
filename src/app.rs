@@ -721,7 +721,9 @@ impl cosmic::Application for MinimizedWindows {
             .map(|entry| {
                 let button = self.group_button(entry, self.group_count(&entry.group_key));
                 if let Some(tracker) = self.rectangle_tracker.as_ref() {
-                    tracker.container(tracker_id(&entry.group_key), button).into()
+                    tracker
+                        .container(tracker_id(&entry.group_key), button)
+                        .into()
                 } else {
                     button
                 }
