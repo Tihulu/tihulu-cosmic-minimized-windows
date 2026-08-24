@@ -105,7 +105,11 @@ impl MinimizedWindows {
             icon,
         };
 
-        if let Some(index) = self.windows.iter().position(|window| window.handle == handle) {
+        if let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.handle == handle)
+        {
             self.windows[index] = entry;
         } else {
             self.windows.push(entry);
@@ -191,10 +195,10 @@ impl MinimizedWindows {
 
     fn preview_body(&self) -> cosmic::Element<'_, Message> {
         let Some(handle) = &self.hovered else {
-            return cosmic::widget::space::vertical().height(1).into();
+            return cosmic::widget::text("").into();
         };
         let Some(entry) = self.entry(handle) else {
-            return cosmic::widget::space::vertical().height(1).into();
+            return cosmic::widget::text("").into();
         };
 
         let visual: cosmic::Element<'_, Message> = if let Some(image) = &self.preview_image {
@@ -205,7 +209,7 @@ impl MinimizedWindows {
             ))
             .width(Length::Fixed(PREVIEW_WIDTH))
             .height(Length::Fixed(PREVIEW_HEIGHT))
-            .content_fit(cosmic::iced::ContentFit::Contain)
+            .content_fit(cosmic::iced::core::ContentFit::Contain)
             .into()
         } else {
             cosmic::widget::container(
@@ -218,10 +222,8 @@ impl MinimizedWindows {
             .into()
         };
 
-        let mut children: Vec<cosmic::Element<'_, Message>> = vec![
-            visual,
-            cosmic::widget::text(&entry.app_label).into(),
-        ];
+        let mut children: Vec<cosmic::Element<'_, Message>> =
+            vec![visual, cosmic::widget::text(&entry.app_label).into()];
         if entry.title != entry.app_label {
             children.push(cosmic::widget::text(&entry.title).into());
         }
@@ -337,15 +339,13 @@ impl cosmic::Application for MinimizedWindows {
                 let token = self.hover_token;
                 self.hovered = Some(handle.clone());
 
-                let delayed = cosmic::iced::Task::perform(
-                    tokio::time::sleep(HOVER_DELAY),
-                    move |()| {
+                let delayed =
+                    cosmic::iced::Task::perform(tokio::time::sleep(HOVER_DELAY), move |()| {
                         cosmic::Action::App(Message::HoverDelayElapsed {
                             token,
                             handle: handle.clone(),
                         })
-                    },
-                );
+                    });
 
                 if let Some(id) = self.preview_popup.take() {
                     use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
@@ -414,7 +414,7 @@ impl cosmic::Application for MinimizedWindows {
         if self.preview_popup == Some(id) {
             self.core.applet.popup_container(self.preview_body()).into()
         } else {
-            cosmic::widget::space::vertical().height(1).into()
+            cosmic::widget::text("").into()
         }
     }
 
