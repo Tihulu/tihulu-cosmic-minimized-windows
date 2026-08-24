@@ -20,6 +20,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Auto-format PR branch once
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin "$GITHUB_HEAD_REF"
+          git checkout -B "$GITHUB_HEAD_REF" "origin/$GITHUB_HEAD_REF"
+          cargo fmt --all
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -u
+            git commit -m "Apply rustfmt to v0.3"
+            git push origin "HEAD:$GITHUB_HEAD_REF"
+            echo "Formatting commit pushed; a fresh CI run will validate it."
+            exit 1
+          fi
       - name: Install system dependencies
         run: |
           sudo apt-get update
