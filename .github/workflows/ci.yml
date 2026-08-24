@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake libegl1-mesa-dev libexpat1-dev libfontconfig-dev \
+            cmake libdbus-1-dev libegl1-mesa-dev libexpat1-dev libfontconfig-dev \
             libfreetype-dev libwayland-dev libxkbcommon-dev pkgconf
       - name: Formatting
         run: cargo fmt --all -- --check
