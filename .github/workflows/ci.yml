@@ -33,7 +33,17 @@ jobs:
       - name: Test
         run: cargo test --all-targets
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
+      - name: Upload Clippy log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-log
+          path: clippy.log
+          if-no-files-found: ignore
 
   promote-stable:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

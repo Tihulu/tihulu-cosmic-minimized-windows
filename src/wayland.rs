@@ -2,12 +2,11 @@
 
 use std::{
     collections::HashSet,
-    fs::File,
-    io::{Read, Seek, SeekFrom},
     os::{
         fd::{AsFd, FromRawFd, RawFd},
         unix::net::UnixStream,
     },
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -15,11 +14,6 @@ use std::{
     time::Duration,
 };
 
-use cctk::wayland_client::{
-    Connection, QueueHandle, WEnum, delegate_noop,
-    globals::registry_queue_init,
-    protocol::{wl_buffer, wl_seat::WlSeat, wl_shm, wl_shm_pool},
-};
 use cctk::{
     screencopy::{
         CaptureFrame, CaptureOptions, CaptureSession, CaptureSource, Capturer, FailureReason,
@@ -34,28 +28,28 @@ use cctk::{
     },
     toplevel_info::{ToplevelInfo, ToplevelInfoHandler, ToplevelInfoState},
     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
-};
-use cosmic::{
-    cctk::{
-        cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
-        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    wayland_client::{
+        Connection, QueueHandle, WEnum, delegate_noop,
+        globals::registry_queue_init,
+        protocol::{wl_buffer, wl_seat::WlSeat, wl_shm, wl_shm_pool},
     },
-    iced::{Subscription, core::Bytes, futures, stream},
+    wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
 };
+use cosmic::iced::{Subscription, futures, stream};
 use cosmic_protocols::{
-    toplevel_info::v1::client::zcosmic_toplevel_handle_v1,
+    toplevel_info::v1::client::zcosmic_toplevel_handle_v1::{self, ZcosmicToplevelHandleV1},
     toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
 };
 use futures::{SinkExt, channel::mpsc};
 use sctk::registry::{ProvidesRegistryState, RegistryState};
 
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const PREVIEW_MAX_WIDTH: u32 = 320;
 const PREVIEW_MAX_HEIGHT: u32 = 180;
-const CAPTURE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Debug)]
 pub struct PreviewImage {
-    pub pixels: Bytes,
+    pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }
@@ -70,24 +64,14 @@ pub enum WindowDelta {
 pub enum BridgeEvent {
     Ready(calloop::channel::Sender<BridgeCommand>),
     Window(Box<WindowDelta>),
-    Preview {
-        token: u64,
-        handle: ExtForeignToplevelHandleV1,
-        image: Option<PreviewImage>,
-    },
+    Preview(ExtForeignToplevelHandleV1, Option<PreviewImage>),
     Stopped,
 }
 
 #[derive(Clone, Debug)]
 pub enum BridgeCommand {
     Restore(ExtForeignToplevelHandleV1),
-    CapturePreview {
-        token: u64,
-        handle: ExtForeignToplevelHandleV1,
-    },
-    CancelPreview {
-        token: u64,
-    },
+    CapturePreview(ExtForeignToplevelHandleV1),
 }
 
 pub fn subscription() -> Subscription<BridgeEvent> {
@@ -115,75 +99,79 @@ pub fn subscription() -> Subscription<BridgeEvent> {
 }
 
 #[derive(Default)]
-struct CaptureWaitInner {
+struct CaptureState {
     formats: Option<Formats>,
-    result: Option<bool>,
+    completed: Option<bool>,
 }
 
 #[derive(Default)]
-struct CaptureWait {
-    inner: Mutex<CaptureWaitInner>,
-    condvar: Condvar,
+struct CaptureWaiter {
+    state: Mutex<CaptureState>,
+    changed: Condvar,
 }
 
-impl CaptureWait {
+impl CaptureWaiter {
     fn set_formats(&self, formats: Formats) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.formats = Some(formats);
-            self.condvar.notify_all();
+        if let Ok(mut state) = self.state.lock() {
+            state.formats = Some(formats);
+            self.changed.notify_all();
         }
     }
 
-    fn set_result(&self, result: bool) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.result = Some(result);
-            self.condvar.notify_all();
+    fn finish(&self, success: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.completed.is_none() {
+                state.completed = Some(success);
+            }
+            self.changed.notify_all();
         }
     }
 
     fn wait_formats(&self) -> Option<Formats> {
-        let guard = self
-            .condvar
-            .wait_timeout_while(self.inner.lock().ok()?, CAPTURE_TIMEOUT, |inner| {
-                inner.formats.is_none()
-            })
-            .ok()?
-            .0;
-        guard.formats.clone()
+        let state = self.state.lock().ok()?;
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, CAPTURE_TIMEOUT, |state| state.formats.is_none())
+            .ok()?;
+        if timeout.timed_out() && state.formats.is_none() {
+            return None;
+        }
+        state.formats.clone()
     }
 
-    fn wait_result(&self) -> Option<bool> {
-        let guard = self
-            .condvar
-            .wait_timeout_while(self.inner.lock().ok()?, CAPTURE_TIMEOUT, |inner| {
-                inner.result.is_none()
-            })
-            .ok()?
-            .0;
-        guard.result
+    fn wait_completed(&self) -> Option<bool> {
+        let state = self.state.lock().ok()?;
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, CAPTURE_TIMEOUT, |state| state.completed.is_none())
+            .ok()?;
+        if timeout.timed_out() && state.completed.is_none() {
+            return None;
+        }
+        state.completed
     }
 }
 
-struct PreviewSessionData {
-    wait: Arc<CaptureWait>,
-    base: ScreencopySessionData,
+struct CaptureSessionData {
+    waiter: Arc<CaptureWaiter>,
+    protocol: ScreencopySessionData,
 }
 
-impl ScreencopySessionDataExt for PreviewSessionData {
+impl ScreencopySessionDataExt for CaptureSessionData {
     fn screencopy_session_data(&self) -> &ScreencopySessionData {
-        &self.base
+        &self.protocol
     }
 }
 
-struct PreviewFrameData {
-    wait: Arc<CaptureWait>,
-    base: ScreencopyFrameData,
+struct CaptureFrameData {
+    waiter: Arc<CaptureWaiter>,
+    protocol: ScreencopyFrameData,
     _session: CaptureSession,
 }
 
-impl ScreencopyFrameDataExt for PreviewFrameData {
+impl ScreencopyFrameDataExt for CaptureFrameData {
     fn screencopy_frame_data(&self) -> &ScreencopyFrameData {
-        &self.base
+        &self.protocol
     }
 }
 
@@ -196,62 +184,45 @@ struct CaptureContext {
 }
 
 impl CaptureContext {
-    fn capture(
-        &self,
-        source: ExtForeignToplevelHandleV1,
-        cancelled: &AtomicBool,
-    ) -> Option<PreviewImage> {
-        if cancelled.load(Ordering::Acquire) {
-            return None;
-        }
-
-        let wait = Arc::new(CaptureWait::default());
+    fn capture(&self, handle: ExtForeignToplevelHandleV1) -> Option<PreviewImage> {
+        let waiter = Arc::new(CaptureWaiter::default());
         let session = self
             .capturer
             .create_session(
-                &CaptureSource::Toplevel(source),
+                &CaptureSource::Toplevel(handle),
                 CaptureOptions::empty(),
                 &self.qh,
-                PreviewSessionData {
-                    wait: wait.clone(),
-                    base: ScreencopySessionData::default(),
+                CaptureSessionData {
+                    waiter: waiter.clone(),
+                    protocol: ScreencopySessionData::default(),
                 },
             )
             .ok()?;
+        self.connection.flush().ok()?;
 
-        if self.connection.flush().is_err() {
-            return None;
-        }
-
-        let formats = wait.wait_formats()?;
-        if cancelled.load(Ordering::Acquire) {
-            return None;
-        }
-
+        let formats = waiter.wait_formats()?;
         let (width, height) = formats.buffer_size;
         if width == 0 || height == 0 || !formats.shm_formats.contains(&wl_shm::Format::Abgr8888) {
             return None;
         }
 
-        let pixel_count = width.checked_mul(height)?;
-        let buffer_len = pixel_count.checked_mul(4)?;
-        if buffer_len > i32::MAX as u32 {
-            return None;
-        }
+        let byte_len = usize::try_from(width)
+            .ok()?
+            .checked_mul(usize::try_from(height).ok()?)?
+            .checked_mul(4)?;
+        let pool_len = i32::try_from(byte_len).ok()?;
 
         let fd =
             rustix::fs::memfd_create(c"tihulu-minimized-preview", rustix::fs::MemfdFlags::CLOEXEC)
                 .ok()?;
-        rustix::fs::ftruncate(&fd, u64::from(buffer_len)).ok()?;
+        rustix::fs::ftruncate(&fd, u64::try_from(byte_len).ok()?).ok()?;
 
-        let pool = self
-            .wl_shm
-            .create_pool(fd.as_fd(), buffer_len as i32, &self.qh, ());
+        let pool = self.wl_shm.create_pool(fd.as_fd(), pool_len, &self.qh, ());
         let buffer = pool.create_buffer(
             0,
-            width as i32,
-            height as i32,
-            width.saturating_mul(4) as i32,
+            i32::try_from(width).ok()?,
+            i32::try_from(height).ok()?,
+            i32::try_from(width.checked_mul(4)?).ok()?,
             wl_shm::Format::Abgr8888,
             &self.qh,
             (),
@@ -261,79 +232,67 @@ impl CaptureContext {
             &buffer,
             &[],
             &self.qh,
-            PreviewFrameData {
-                wait: wait.clone(),
-                base: ScreencopyFrameData::default(),
+            CaptureFrameData {
+                waiter: waiter.clone(),
+                protocol: ScreencopyFrameData::default(),
                 _session: session.clone(),
             },
         );
+        if self.connection.flush().is_err() {
+            buffer.destroy();
+            pool.destroy();
+            return None;
+        }
 
-        let flushed = self.connection.flush().is_ok();
-        let ready = flushed && wait.wait_result().unwrap_or(false);
-
-        drop(frame);
-        drop(session);
+        let completed = waiter.wait_completed().unwrap_or(false);
         buffer.destroy();
         pool.destroy();
-        let _ = self.connection.flush();
-
-        if !ready || cancelled.load(Ordering::Acquire) {
+        drop(frame);
+        drop(session);
+        if !completed {
             return None;
         }
 
-        let mut file = File::from(fd);
-        file.seek(SeekFrom::Start(0)).ok()?;
-        let mut raw = vec![0_u8; buffer_len as usize];
-        file.read_exact(&mut raw).ok()?;
-        drop(file);
+        let mmap = unsafe { memmap2::MmapOptions::new().len(byte_len).map(&fd).ok()? };
+        let mut image = image::RgbaImage::from_raw(width, height, mmap.to_vec())?;
+        drop(mmap);
+        drop(fd);
 
-        if cancelled.load(Ordering::Acquire) {
-            return None;
+        let scale = (PREVIEW_MAX_WIDTH as f64 / f64::from(width))
+            .min(PREVIEW_MAX_HEIGHT as f64 / f64::from(height))
+            .min(1.0);
+        if scale < 1.0 {
+            let target_width = (f64::from(width) * scale).round().max(1.0) as u32;
+            let target_height = (f64::from(height) * scale).round().max(1.0) as u32;
+            image = image::imageops::resize(
+                &image,
+                target_width,
+                target_height,
+                image::imageops::FilterType::Triangle,
+            );
         }
-
-        let image = image::RgbaImage::from_raw(width, height, raw)?;
-        let thumbnail = image::imageops::thumbnail(&image, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT);
-        let preview_width = thumbnail.width();
-        let preview_height = thumbnail.height();
-        let pixels = thumbnail.into_raw();
 
         Some(PreviewImage {
-            pixels: Bytes::copy_from_slice(&pixels),
-            width: preview_width,
-            height: preview_height,
+            width: image.width(),
+            height: image.height(),
+            rgba: image.into_raw(),
         })
     }
-}
-
-#[derive(Clone, Debug)]
-struct CaptureJob {
-    token: u64,
-    handle: ExtForeignToplevelHandleV1,
-}
-
-#[derive(Debug)]
-struct CaptureWorkerResult {
-    job: CaptureJob,
-    image: Option<PreviewImage>,
-    cancelled: bool,
 }
 
 struct BridgeState {
     done: bool,
     out: mpsc::Sender<BridgeEvent>,
-    connection: Connection,
-    qh: QueueHandle<Self>,
     registry: RegistryState,
     seats: SeatState,
     toplevels: ToplevelInfoState,
     manager: ToplevelManagerState,
     screencopy: ScreencopyState,
     shm: Shm,
+    qh: QueueHandle<Self>,
+    connection: Connection,
     shown: HashSet<ExtForeignToplevelHandleV1>,
-    capture_done_tx: calloop::channel::Sender<CaptureWorkerResult>,
-    capture_running: Option<CaptureJob>,
-    capture_cancel: Option<Arc<AtomicBool>>,
-    capture_pending: Option<CaptureJob>,
+    capture_busy: Arc<AtomicBool>,
 }
 
 impl BridgeState {
@@ -354,7 +313,6 @@ impl BridgeState {
         let Some(info) = self.toplevels.info(handle).cloned() else {
             return;
         };
-
         let minimized = info
             .state
             .contains(&zcosmic_toplevel_handle_v1::State::Minimized);
@@ -368,7 +326,6 @@ impl BridgeState {
             }
             (false, true) => {
                 self.shown.remove(handle);
-                self.cancel_capture_for(handle);
                 self.emit(BridgeEvent::Window(Box::new(WindowDelta::Gone(
                     handle.clone(),
                 ))));
@@ -378,7 +335,6 @@ impl BridgeState {
     }
 
     fn forget(&mut self, handle: &ExtForeignToplevelHandleV1) {
-        self.cancel_capture_for(handle);
         if self.shown.remove(handle) {
             self.emit(BridgeEvent::Window(Box::new(WindowDelta::Gone(
                 handle.clone(),
@@ -386,97 +342,27 @@ impl BridgeState {
         }
     }
 
-    fn capture_context(&self) -> CaptureContext {
-        CaptureContext {
+    fn request_preview(&mut self, handle: ExtForeignToplevelHandleV1) {
+        if self.capture_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let context = CaptureContext {
             qh: self.qh.clone(),
             connection: self.connection.clone(),
             wl_shm: self.shm.wl_shm().clone(),
             capturer: self.screencopy.capturer().clone(),
-        }
-    }
-
-    fn request_capture(&mut self, job: CaptureJob) {
-        if self.capture_running.is_some() {
-            if let Some(cancel) = &self.capture_cancel {
-                cancel.store(true, Ordering::Release);
-            }
-            self.capture_pending = Some(job);
-            return;
-        }
-        self.start_capture(job);
-    }
-
-    fn start_capture(&mut self, job: CaptureJob) {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_worker = cancelled.clone();
-        let context = self.capture_context();
-        let done = self.capture_done_tx.clone();
-        let worker_job = job.clone();
-
-        self.capture_running = Some(job);
-        self.capture_cancel = Some(cancelled);
+        };
+        let busy = self.capture_busy.clone();
+        let mut out = self.out.clone();
 
         std::thread::spawn(move || {
-            let image = context.capture(worker_job.handle.clone(), &cancelled_worker);
-            let result = CaptureWorkerResult {
-                job: worker_job,
-                image,
-                cancelled: cancelled_worker.load(Ordering::Acquire),
-            };
-            let _ = done.send(result);
+            let result = catch_unwind(AssertUnwindSafe(|| context.capture(handle.clone())))
+                .ok()
+                .flatten();
+            busy.store(false, Ordering::Release);
+            let _ = futures::executor::block_on(out.send(BridgeEvent::Preview(handle, result)));
         });
-    }
-
-    fn cancel_token(&mut self, token: u64) {
-        if self.capture_running.as_ref().map(|job| job.token) == Some(token)
-            && let Some(cancel) = &self.capture_cancel
-        {
-            cancel.store(true, Ordering::Release);
-        }
-        if self.capture_pending.as_ref().map(|job| job.token) == Some(token) {
-            self.capture_pending = None;
-        }
-    }
-
-    fn cancel_capture_for(&mut self, handle: &ExtForeignToplevelHandleV1) {
-        if self
-            .capture_running
-            .as_ref()
-            .is_some_and(|job| &job.handle == handle)
-            && let Some(cancel) = &self.capture_cancel
-        {
-            cancel.store(true, Ordering::Release);
-        }
-        if self
-            .capture_pending
-            .as_ref()
-            .is_some_and(|job| &job.handle == handle)
-        {
-            self.capture_pending = None;
-        }
-    }
-
-    fn capture_finished(&mut self, result: CaptureWorkerResult) {
-        let is_current =
-            self.capture_running.as_ref().map(|job| job.token) == Some(result.job.token);
-        if is_current {
-            self.capture_running = None;
-            self.capture_cancel = None;
-        }
-
-        if is_current && !result.cancelled {
-            self.emit(BridgeEvent::Preview {
-                token: result.job.token,
-                handle: result.job.handle,
-                image: result.image,
-            });
-        }
-
-        if self.capture_running.is_none()
-            && let Some(next) = self.capture_pending.take()
-        {
-            self.start_capture(next);
-        }
     }
 }
 
@@ -494,6 +380,7 @@ impl SeatHandler for BridgeState {
     }
 
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+
     fn new_capability(
         &mut self,
         _: &Connection,
@@ -502,6 +389,7 @@ impl SeatHandler for BridgeState {
         _: sctk::seat::Capability,
     ) {
     }
+
     fn remove_capability(
         &mut self,
         _: &Connection,
@@ -510,6 +398,7 @@ impl SeatHandler for BridgeState {
         _: sctk::seat::Capability,
     ) {
     }
+
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
 }
 
@@ -531,20 +420,20 @@ impl ScreencopyHandler for BridgeState {
         session: &CaptureSession,
         formats: &Formats,
     ) {
-        if let Some(data) = session.data::<PreviewSessionData>() {
-            data.wait.set_formats(formats.clone());
+        if let Some(data) = session.data::<CaptureSessionData>() {
+            data.waiter.set_formats(formats.clone());
         }
     }
 
     fn stopped(&mut self, _: &Connection, _: &QueueHandle<Self>, session: &CaptureSession) {
-        if let Some(data) = session.data::<PreviewSessionData>() {
-            data.wait.set_result(false);
+        if let Some(data) = session.data::<CaptureSessionData>() {
+            data.waiter.finish(false);
         }
     }
 
     fn ready(&mut self, _: &Connection, _: &QueueHandle<Self>, frame: &CaptureFrame, _: Frame) {
-        if let Some(data) = frame.data::<PreviewFrameData>() {
-            data.wait.set_result(true);
+        if let Some(data) = frame.data::<CaptureFrameData>() {
+            data.waiter.finish(true);
         }
     }
 
@@ -555,8 +444,8 @@ impl ScreencopyHandler for BridgeState {
         frame: &CaptureFrame,
         _: WEnum<FailureReason>,
     ) {
-        if let Some(data) = frame.data::<PreviewFrameData>() {
-            data.wait.set_result(false);
+        if let Some(data) = frame.data::<CaptureFrameData>() {
+            data.waiter.finish(false);
         }
     }
 }
@@ -608,18 +497,6 @@ impl ToplevelManagerHandler for BridgeState {
     }
 }
 
-impl cctk::wayland_client::Dispatch<wl_shm_pool::WlShmPool, ()> for BridgeState {
-    fn event(
-        _: &mut Self,
-        _: &wl_shm_pool::WlShmPool,
-        _: wl_shm_pool::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
 fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Channel<BridgeCommand>) {
     let privileged = std::env::var("X_PRIVILEGED_WAYLAND_SOCKET")
         .ok()
@@ -639,7 +516,6 @@ fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Chann
         tracing::error!("Could not initialize Wayland registry");
         return;
     };
-
     let Ok(mut loop_) = calloop::EventLoop::<BridgeState>::try_new() else {
         tracing::error!("Could not create Wayland event loop");
         return;
@@ -652,18 +528,6 @@ fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Chann
         return;
     }
 
-    let (capture_done_tx, capture_done_rx) = calloop::channel::channel();
-    if loop_handle
-        .insert_source(capture_done_rx, |event, (), state| {
-            if let calloop::channel::Event::Msg(result) = event {
-                state.capture_finished(result);
-            }
-        })
-        .is_err()
-    {
-        return;
-    }
-
     if loop_handle
         .insert_source(commands, |event, (), state| match event {
             calloop::channel::Event::Msg(BridgeCommand::Restore(handle)) => {
@@ -673,11 +537,8 @@ fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Chann
                     state.manager.manager.activate(&cosmic, &seat);
                 }
             }
-            calloop::channel::Event::Msg(BridgeCommand::CapturePreview { token, handle }) => {
-                state.request_capture(CaptureJob { token, handle });
-            }
-            calloop::channel::Event::Msg(BridgeCommand::CancelPreview { token }) => {
-                state.cancel_token(token);
+            calloop::channel::Event::Msg(BridgeCommand::CapturePreview(handle)) => {
+                state.request_preview(handle);
             }
             calloop::channel::Event::Closed => state.done = true,
         })
@@ -687,28 +548,24 @@ fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Chann
     }
 
     let registry = RegistryState::new(&globals);
-    let screencopy = ScreencopyState::new(&globals, &qh);
     let Ok(shm) = Shm::bind(&globals, &qh) else {
-        tracing::error!("Could not bind Wayland SHM for minimized-window previews");
+        tracing::error!("Could not bind wl_shm for hover previews");
         return;
     };
-
+    let screencopy = ScreencopyState::new(&globals, &qh);
     let mut state = BridgeState {
         done: false,
         out,
-        connection,
-        qh: qh.clone(),
         seats: SeatState::new(&globals, &qh),
         toplevels: ToplevelInfoState::new(&registry, &qh),
         manager: ToplevelManagerState::new(&registry, &qh),
         screencopy,
         shm,
+        qh,
+        connection,
         registry,
         shown: HashSet::new(),
-        capture_done_tx,
-        capture_running: None,
-        capture_cancel: None,
-        capture_pending: None,
+        capture_busy: Arc::new(AtomicBool::new(false)),
     };
 
     while !state.done {
@@ -726,3 +583,4 @@ cctk::delegate_toplevel_info!(BridgeState);
 cctk::delegate_toplevel_manager!(BridgeState);
 cctk::delegate_screencopy!(BridgeState);
 delegate_noop!(BridgeState: ignore wl_buffer::WlBuffer);
+delegate_noop!(BridgeState: ignore wl_shm_pool::WlShmPool);

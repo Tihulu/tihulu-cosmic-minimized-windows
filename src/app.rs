@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, sync::LazyLock, time::Duration};
 
 use cctk::toplevel_info::ToplevelInfo;
 use cosmic::{
+    app::Task,
+    applet::cosmic_panel_config::PanelAnchor,
     cctk::{
         sctk::reexports::calloop,
         wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
     },
     desktop::{IconSourceExt, fde},
-    iced::{Length, Subscription, window::Id},
+    iced::{self, Length, Limits, Subscription, id::Id as WidgetId, window::Id as WindowId},
+    widget::{Image, autosize::autosize, image::Handle},
 };
 
 use crate::wayland::{self, BridgeCommand, BridgeEvent, PreviewImage, WindowDelta};
@@ -18,6 +21,9 @@ const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const HOVER_DELAY: Duration = Duration::from_millis(350);
 const PREVIEW_WIDTH: f32 = 320.0;
 const PREVIEW_HEIGHT: f32 = 180.0;
+
+static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> =
+    LazyLock::new(|| WidgetId::new("tihulu-minimized-windows-main"));
 
 pub(crate) fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<MinimizedWindows>(())
@@ -38,9 +44,8 @@ struct MinimizedWindows {
     windows: Vec<Entry>,
     command_tx: Option<calloop::channel::Sender<BridgeCommand>>,
     hovered: Option<ExtForeignToplevelHandleV1>,
-    hover_token: u64,
-    active_capture_token: Option<u64>,
-    preview_popup: Option<Id>,
+    hover_epoch: u64,
+    preview_popup: Option<WindowId>,
     preview_image: Option<PreviewImage>,
 }
 
@@ -48,13 +53,10 @@ struct MinimizedWindows {
 enum Message {
     Bridge(Box<BridgeEvent>),
     Restore(ExtForeignToplevelHandleV1),
-    HoverEntered(ExtForeignToplevelHandleV1),
-    HoverLeft(ExtForeignToplevelHandleV1),
-    HoverDelayElapsed {
-        token: u64,
-        handle: ExtForeignToplevelHandleV1,
-    },
-    PreviewClosed(Id),
+    HoverEnter(ExtForeignToplevelHandleV1),
+    HoverExit(ExtForeignToplevelHandleV1),
+    HoverDelayElapsed(ExtForeignToplevelHandleV1, u64),
+    PreviewClosed(WindowId),
 }
 
 impl MinimizedWindows {
@@ -91,11 +93,10 @@ impl MinimizedWindows {
     fn upsert(&mut self, info: ToplevelInfo) {
         let handle = info.foreign_toplevel.clone();
         let (app_label, icon) = self.app_visuals(&info.app_id);
-        let raw_title = info.title.trim();
-        let title = if raw_title.is_empty() {
+        let title = if info.title.trim().is_empty() {
             app_label.clone()
         } else {
-            raw_title.to_owned()
+            info.title.trim().to_owned()
         };
 
         let entry = Entry {
@@ -120,34 +121,6 @@ impl MinimizedWindows {
         self.windows.retain(|window| &window.handle != handle);
     }
 
-    fn entry(&self, handle: &ExtForeignToplevelHandleV1) -> Option<&Entry> {
-        self.windows.iter().find(|entry| &entry.handle == handle)
-    }
-
-    fn send_cancel(&mut self) {
-        let Some(token) = self.active_capture_token.take() else {
-            return;
-        };
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send(BridgeCommand::CancelPreview { token });
-        }
-    }
-
-    fn clear_preview(&mut self) -> cosmic::app::Task<Message> {
-        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
-
-        self.send_cancel();
-        self.preview_image = None;
-        self.hovered = None;
-        self.hover_token = self.hover_token.wrapping_add(1);
-
-        if let Some(id) = self.preview_popup.take() {
-            destroy_popup(id)
-        } else {
-            cosmic::task::none()
-        }
-    }
-
     fn window_button<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
         let icon = entry.icon.as_cosmic_icon();
         let symbolic = icon.symbolic;
@@ -168,52 +141,117 @@ impl MinimizedWindows {
         .padding([py as f32, px as f32])
         .on_press_down(Message::Restore(entry.handle.clone()));
 
-        cosmic::iced::widget::mouse_area(button)
-            .on_enter(Message::HoverEntered(entry.handle.clone()))
-            .on_exit(Message::HoverLeft(entry.handle.clone()))
+        cosmic::widget::mouse_area(button)
+            .on_enter(Message::HoverEnter(entry.handle.clone()))
+            .on_exit(Message::HoverExit(entry.handle.clone()))
             .into()
     }
 
-    fn open_preview_popup(&mut self) -> cosmic::app::Task<Message> {
+    fn close_preview_surface(&mut self) -> Task<Message> {
+        self.preview_image = None;
+        let Some(id) = self.preview_popup.take() else {
+            return cosmic::task::none();
+        };
+
+        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
+        destroy_popup(id)
+    }
+
+    fn preview_anchor_rect(&self, handle: &ExtForeignToplevelHandleV1) -> iced::Rectangle<i32> {
+        let index = self
+            .windows
+            .iter()
+            .position(|entry| &entry.handle == handle)
+            .unwrap_or_default() as u32;
+        let (icon_width, icon_height) = self.core.applet.suggested_size(false);
+        let (major, minor) = self.core.applet.suggested_padding(false);
+        let (width, height, stride) = if self.core.applet.is_horizontal() {
+            (
+                u32::from(icon_width) + u32::from(major) * 2,
+                u32::from(icon_height) + u32::from(minor) * 2,
+                u32::from(icon_width) + u32::from(major) * 2 + self.core.applet.spacing,
+            )
+        } else {
+            (
+                u32::from(icon_width) + u32::from(minor) * 2,
+                u32::from(icon_height) + u32::from(major) * 2,
+                u32::from(icon_height) + u32::from(major) * 2 + self.core.applet.spacing,
+            )
+        };
+        let offset = index.saturating_mul(stride);
+
+        match self.core.applet.anchor {
+            PanelAnchor::Top | PanelAnchor::Bottom => iced::Rectangle {
+                x: i32::try_from(offset).unwrap_or(i32::MAX),
+                y: 0,
+                width: i32::try_from(width).unwrap_or(i32::MAX),
+                height: i32::try_from(height).unwrap_or(i32::MAX),
+            },
+            PanelAnchor::Left | PanelAnchor::Right => iced::Rectangle {
+                x: 0,
+                y: i32::try_from(offset).unwrap_or(i32::MAX),
+                width: i32::try_from(width).unwrap_or(i32::MAX),
+                height: i32::try_from(height).unwrap_or(i32::MAX),
+            },
+        }
+    }
+
+    fn open_preview_surface(&mut self, handle: &ExtForeignToplevelHandleV1) -> Task<Message> {
         use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
 
-        let id = Id::unique();
-        let settings = self.core.applet.get_popup_settings(
+        let previous = self.preview_popup.take();
+        let id = WindowId::unique();
+        self.preview_popup = Some(id);
+
+        let mut settings = self.core.applet.get_popup_settings(
             self.core.main_window_id().unwrap(),
             id,
             None,
             None,
             None,
         );
+        settings.positioner.anchor_rect = self.preview_anchor_rect(handle);
+        let open = get_popup(settings);
 
-        if let Some(old) = self.preview_popup.replace(id) {
-            cosmic::app::Task::batch([destroy_popup(old), get_popup(settings)])
+        if let Some(previous) = previous {
+            Task::batch([destroy_popup(previous), open])
         } else {
-            get_popup(settings)
+            open
         }
     }
 
-    fn preview_body(&self) -> cosmic::Element<'_, Message> {
-        let Some(handle) = &self.hovered else {
-            return cosmic::widget::text("").into();
+    fn hover_delay_task(handle: ExtForeignToplevelHandleV1, epoch: u64) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::time::sleep(HOVER_DELAY).await;
+                (handle, epoch)
+            },
+            |(handle, epoch)| cosmic::Action::App(Message::HoverDelayElapsed(handle, epoch)),
+        )
+    }
+
+    fn preview_card(&self) -> cosmic::Element<'_, Message> {
+        let Some(handle) = self.hovered.as_ref() else {
+            return cosmic::widget::space::horizontal().into();
         };
-        let Some(entry) = self.entry(handle) else {
-            return cosmic::widget::text("").into();
+        let Some(entry) = self.windows.iter().find(|entry| &entry.handle == handle) else {
+            return cosmic::widget::space::horizontal().into();
         };
 
-        let visual: cosmic::Element<'_, Message> = if let Some(image) = &self.preview_image {
-            cosmic::widget::Image::new(cosmic::widget::image::Handle::from_rgba(
+        let visual: cosmic::Element<_> = if let Some(image) = self.preview_image.as_ref() {
+            Image::new(Handle::from_rgba(
                 image.width,
                 image.height,
-                image.pixels.clone(),
+                image.rgba.clone(),
             ))
             .width(Length::Fixed(PREVIEW_WIDTH))
             .height(Length::Fixed(PREVIEW_HEIGHT))
-            .content_fit(cosmic::iced::core::ContentFit::Contain)
+            .content_fit(iced::ContentFit::Contain)
             .into()
         } else {
+            let icon = entry.icon.as_cosmic_icon();
             cosmic::widget::container(
-                cosmic::widget::icon(entry.icon.as_cosmic_icon())
+                cosmic::widget::icon(icon)
                     .width(Length::Fixed(72.0))
                     .height(Length::Fixed(72.0)),
             )
@@ -222,13 +260,9 @@ impl MinimizedWindows {
             .into()
         };
 
-        let mut children: Vec<cosmic::Element<'_, Message>> =
-            vec![visual, cosmic::widget::text(&entry.app_label).into()];
-        if entry.title != entry.app_label {
-            children.push(cosmic::widget::text(&entry.title).into());
-        }
-
-        cosmic::widget::column::with_children(children)
+        let app_name = cosmic::widget::text(&entry.app_label);
+        let title = cosmic::widget::text(&entry.title);
+        cosmic::widget::column::with_children(vec![visual, app_name.into(), title.into()])
             .spacing(6.0)
             .width(Length::Fixed(PREVIEW_WIDTH))
             .into()
@@ -242,10 +276,7 @@ impl cosmic::Application for MinimizedWindows {
 
     const APP_ID: &'static str = APP_ID;
 
-    fn init(
-        core: cosmic::app::Core,
-        _flags: Self::Flags,
-    ) -> (Self, cosmic::app::Task<Self::Message>) {
+    fn init(core: cosmic::app::Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
         let mut app = Self {
             core,
             language: fde::get_languages_from_env(),
@@ -272,7 +303,7 @@ impl cosmic::Application for MinimizedWindows {
         wayland::subscription().map(|event| Message::Bridge(Box::new(event)))
     }
 
-    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
+    fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::Bridge(event) => match *event {
                 BridgeEvent::Ready(tx) => {
@@ -281,7 +312,6 @@ impl cosmic::Application for MinimizedWindows {
                 BridgeEvent::Stopped => {
                     self.command_tx = None;
                     tracing::error!("Minimized-window Wayland bridge stopped");
-                    return self.clear_preview();
                 }
                 BridgeEvent::Window(delta) => match *delta {
                     WindowDelta::Present(info) => {
@@ -295,93 +325,73 @@ impl cosmic::Application for MinimizedWindows {
                         }
                     }
                     WindowDelta::Gone(handle) => {
-                        let preview_was_for_window = self.hovered.as_ref() == Some(&handle);
+                        let hovered_gone = self.hovered.as_ref() == Some(&handle);
                         self.remove(&handle);
+                        let close = if hovered_gone {
+                            self.hover_epoch = self.hover_epoch.wrapping_add(1);
+                            self.hovered = None;
+                            self.close_preview_surface()
+                        } else {
+                            cosmic::task::none()
+                        };
 
-                        let mut tasks = Vec::new();
-                        if preview_was_for_window {
-                            tasks.push(self.clear_preview());
-                        }
                         if self.windows.is_empty() {
-                            tasks.push(cosmic::iced::window::minimize(
+                            let hide = cosmic::iced::window::minimize(
                                 self.core.main_window_id().unwrap(),
                                 true,
-                            ));
+                            );
+                            return Task::batch([close, hide]);
                         }
-                        if !tasks.is_empty() {
-                            return cosmic::app::Task::batch(tasks);
-                        }
+                        return close;
                     }
                 },
-                BridgeEvent::Preview {
-                    token,
-                    handle,
-                    image,
-                } => {
-                    if self.hover_token == token && self.hovered.as_ref() == Some(&handle) {
-                        self.active_capture_token = None;
+                BridgeEvent::Preview(handle, image) => {
+                    if self.hovered.as_ref() == Some(&handle) && self.preview_popup.is_some() {
                         self.preview_image = image;
+                    } else if let (Some(current), Some(tx)) =
+                        (self.hovered.clone(), self.command_tx.as_ref())
+                        && self.preview_popup.is_some()
+                        && current != handle
+                    {
+                        let _ = tx.send(BridgeCommand::CapturePreview(current));
                     }
                 }
             },
             Message::Restore(handle) => {
                 if let Some(tx) = &self.command_tx {
-                    let _ = tx.send(BridgeCommand::Restore(handle.clone()));
+                    let _ = tx.send(BridgeCommand::Restore(handle));
                 }
-                if self.hovered.as_ref() == Some(&handle) {
-                    return self.clear_preview();
-                }
+                self.hover_epoch = self.hover_epoch.wrapping_add(1);
+                self.hovered = None;
+                return self.close_preview_surface();
             }
-            Message::HoverEntered(handle) => {
-                self.send_cancel();
-                self.preview_image = None;
-                self.hover_token = self.hover_token.wrapping_add(1);
-                let token = self.hover_token;
+            Message::HoverEnter(handle) => {
+                self.hover_epoch = self.hover_epoch.wrapping_add(1);
+                let epoch = self.hover_epoch;
                 self.hovered = Some(handle.clone());
-
-                let delayed =
-                    cosmic::iced::Task::perform(tokio::time::sleep(HOVER_DELAY), move |()| {
-                        cosmic::Action::App(Message::HoverDelayElapsed {
-                            token,
-                            handle: handle.clone(),
-                        })
-                    });
-
-                if let Some(id) = self.preview_popup.take() {
-                    use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
-                    return cosmic::app::Task::batch([destroy_popup(id), delayed]);
-                }
-                return delayed;
+                let close = self.close_preview_surface();
+                return Task::batch([close, Self::hover_delay_task(handle, epoch)]);
             }
-            Message::HoverLeft(handle) => {
+            Message::HoverExit(handle) => {
                 if self.hovered.as_ref() == Some(&handle) {
-                    return self.clear_preview();
+                    self.hover_epoch = self.hover_epoch.wrapping_add(1);
+                    self.hovered = None;
+                    return self.close_preview_surface();
                 }
             }
-            Message::HoverDelayElapsed { token, handle } => {
-                if self.hover_token != token || self.hovered.as_ref() != Some(&handle) {
-                    return cosmic::task::none();
+            Message::HoverDelayElapsed(handle, epoch) => {
+                if self.hover_epoch == epoch && self.hovered.as_ref() == Some(&handle) {
+                    self.preview_image = None;
+                    if let Some(tx) = &self.command_tx {
+                        let _ = tx.send(BridgeCommand::CapturePreview(handle.clone()));
+                    }
+                    return self.open_preview_surface(&handle);
                 }
-
-                if let Some(tx) = &self.command_tx
-                    && tx
-                        .send(BridgeCommand::CapturePreview {
-                            token,
-                            handle: handle.clone(),
-                        })
-                        .is_ok()
-                {
-                    self.active_capture_token = Some(token);
-                }
-                return self.open_preview_popup();
             }
             Message::PreviewClosed(id) => {
                 if self.preview_popup == Some(id) {
                     self.preview_popup = None;
-                    self.send_cancel();
                     self.preview_image = None;
-                    self.hovered = None;
-                    self.hover_token = self.hover_token.wrapping_add(1);
                 }
             }
         }
@@ -396,28 +406,36 @@ impl cosmic::Application for MinimizedWindows {
             .map(|entry| self.window_button(entry))
             .collect::<Vec<_>>();
 
-        if self.core.applet.is_horizontal() {
+        let content: cosmic::Element<_> = if self.core.applet.is_horizontal() {
             cosmic::widget::row::with_children(children)
                 .spacing(self.core.applet.spacing as f32)
                 .align_y(cosmic::iced::Alignment::Center)
+                .width(Length::Shrink)
+                .height(Length::Shrink)
                 .into()
         } else {
             cosmic::widget::column::with_children(children)
                 .spacing(self.core.applet.spacing as f32)
                 .align_x(cosmic::iced::Alignment::Center)
+                .width(Length::Shrink)
+                .height(Length::Shrink)
                 .into()
-        }
+        };
+
+        autosize(content, AUTOSIZE_MAIN_ID.clone())
+            .limits(Limits::NONE.min_width(1.0).min_height(1.0))
+            .into()
     }
 
-    fn view_window(&self, id: Id) -> cosmic::Element<'_, Self::Message> {
+    fn view_window(&self, id: WindowId) -> cosmic::Element<'_, Self::Message> {
         if self.preview_popup == Some(id) {
-            self.core.applet.popup_container(self.preview_body()).into()
+            self.core.applet.popup_container(self.preview_card()).into()
         } else {
-            cosmic::widget::text("").into()
+            cosmic::widget::space::horizontal().into()
         }
     }
 
-    fn on_close_requested(&self, id: Id) -> Option<Self::Message> {
+    fn on_close_requested(&self, id: WindowId) -> Option<Self::Message> {
         Some(Message::PreviewClosed(id))
     }
 }
