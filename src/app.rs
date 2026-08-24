@@ -27,9 +27,14 @@ use crate::{
 
 const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const HOVER_DELAY: Duration = Duration::from_millis(350);
-const LEAVE_GRACE: Duration = Duration::from_millis(220);
-const PREVIEW_WIDTH: f32 = 320.0;
-const PREVIEW_HEIGHT: f32 = 180.0;
+const LEAVE_GRACE: Duration = Duration::from_millis(500);
+const SINGLE_PREVIEW_WIDTH: f32 = 320.0;
+const SINGLE_PREVIEW_HEIGHT: f32 = 180.0;
+const GROUP_PREVIEW_WIDTH: f32 = 260.0;
+const GROUP_PREVIEW_HEIGHT: f32 = 146.0;
+const GROUP_COLUMNS: usize = 2;
+const GROUP_GRID_GAP: f32 = 12.0;
+const GROUP_MAX_VIEWPORT_HEIGHT: f32 = 520.0;
 const MAX_PREVIEW_IMAGES: usize = 8;
 
 static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> =
@@ -110,7 +115,7 @@ impl MinimizedWindows {
             .collect();
     }
 
-    fn app_visuals(&mut self, app_id: &str) -> (String, fde::IconSource) {
+    fn app_visuals(&mut self, app_id: &str) -> (String, fde::IconSource, String) {
         let key = fde::unicase::Ascii::new(app_id);
         let found = fde::find_app_by_id(&self.desktop_entries, key)
             .cloned()
@@ -125,15 +130,19 @@ impl MinimizedWindows {
                 .unwrap_or(Cow::Borrowed(&entry.appid))
                 .into_owned();
             let icon = fde::IconSource::from_unknown(entry.icon().unwrap_or(&entry.appid));
-            (label, icon)
+            let group = canonical_group_key(&entry.appid, &label);
+            (label, icon, group)
         } else {
+            let label = if app_id.trim().is_empty() {
+                "Application".to_owned()
+            } else {
+                app_id.to_owned()
+            };
+            let group = canonical_group_key(app_id, &label);
             (
-                if app_id.trim().is_empty() {
-                    "Application".to_owned()
-                } else {
-                    app_id.to_owned()
-                },
+                label,
                 fde::IconSource::from_unknown("application-x-executable-symbolic"),
+                group,
             )
         }
     }
@@ -141,16 +150,11 @@ impl MinimizedWindows {
     fn upsert(&mut self, info: ToplevelInfo) {
         let handle = info.foreign_toplevel.clone();
         let app_id = info.app_id.trim().to_owned();
-        let (app_label, icon) = self.app_visuals(&app_id);
+        let (app_label, icon, group_key) = self.app_visuals(&app_id);
         let title = if info.title.trim().is_empty() {
             app_label.clone()
         } else {
             info.title.trim().to_owned()
-        };
-        let group_key = if app_id.is_empty() {
-            app_label.to_ascii_lowercase()
-        } else {
-            app_id.clone()
         };
 
         let entry = Entry {
@@ -202,13 +206,21 @@ impl MinimizedWindows {
             .collect()
     }
 
+    fn group_titles(&self, group: &str) -> Vec<String> {
+        self.windows
+            .iter()
+            .filter(|entry| entry.group_key == group)
+            .map(|entry| entry.title.clone())
+            .collect()
+    }
+
     fn group_contains_handle(&self, group: &str, handle: &ExtForeignToplevelHandleV1) -> bool {
         self.windows
             .iter()
             .any(|entry| entry.group_key == group && &entry.handle == handle)
     }
 
-    fn group_button<'a>(&self, entry: &'a Entry, count: usize) -> cosmic::Element<'a, Message> {
+    fn group_button<'a>(&self, entry: &'a Entry, _count: usize) -> cosmic::Element<'a, Message> {
         let icon = entry.icon.as_cosmic_icon();
         let symbolic = icon.symbolic;
         let size = self.core.applet.suggested_size(symbolic);
@@ -229,23 +241,13 @@ impl MinimizedWindows {
         .padding([py as f32, px as f32])
         .on_press_down(Message::GroupPrimary(group.clone()));
 
-        let area = cosmic::widget::mouse_area(button)
+        // Tooltips create a second hover surface and can generate enter/leave churn
+        // while the delayed preview is being armed. Keep one pointer surface per icon.
+        cosmic::widget::mouse_area(button)
             .on_enter(Message::GroupHoverEnter(group.clone()))
             .on_exit(Message::GroupHoverExit(group.clone()))
-            .on_right_press(Message::GroupOpen(group));
-
-        cosmic::widget::tooltip(
-            area,
-            cosmic::widget::text(format!("{} ({count})", entry.app_label)),
-            match self.core.applet.anchor {
-                PanelAnchor::Top => cosmic::widget::tooltip::Position::Bottom,
-                PanelAnchor::Bottom => cosmic::widget::tooltip::Position::Top,
-                PanelAnchor::Left => cosmic::widget::tooltip::Position::Right,
-                PanelAnchor::Right => cosmic::widget::tooltip::Position::Left,
-            },
-        )
-        .snap_within_viewport(false)
-        .into()
+            .on_right_press(Message::GroupOpen(group))
+            .into()
     }
 
     fn reset_popup_payload(&mut self) {
@@ -374,9 +376,10 @@ impl MinimizedWindows {
         };
         let app_id = entry.app_id.clone();
         let app_label = entry.app_label.clone();
+        let titles = self.group_titles(group);
         let group = group.to_owned();
 
-        Task::perform(media::snapshot(app_id, app_label), move |snapshot| {
+        Task::perform(media::snapshot(app_id, app_label, titles), move |snapshot| {
             cosmic::Action::App(Message::MediaLoaded(group, snapshot.map(Box::new)))
         })
     }
@@ -426,10 +429,15 @@ impl MinimizedWindows {
         self.request_next_preview();
     }
 
+    fn refresh_open_group(&mut self, group: &str) -> Task<Message> {
+        self.start_preview_sequence(group);
+        self.load_media_task(group)
+    }
+
     fn open_group(&mut self, group: String, pinned: bool) -> Task<Message> {
         if self.active_group.as_deref() == Some(group.as_str()) && self.preview_popup.is_some() {
             self.popup_pinned |= pinned;
-            return cosmic::task::none();
+            return self.refresh_open_group(&group);
         }
 
         self.reset_popup_payload();
@@ -448,11 +456,24 @@ impl MinimizedWindows {
         Self::close_delay_task(self.close_epoch)
     }
 
-    fn preview_visual<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
+    fn preview_dimensions(count: usize) -> (f32, f32, usize) {
+        if count <= 1 {
+            (SINGLE_PREVIEW_WIDTH, SINGLE_PREVIEW_HEIGHT, 1)
+        } else {
+            (GROUP_PREVIEW_WIDTH, GROUP_PREVIEW_HEIGHT, GROUP_COLUMNS)
+        }
+    }
+
+    fn preview_visual<'a>(
+        &self,
+        entry: &'a Entry,
+        width: f32,
+        height: f32,
+    ) -> cosmic::Element<'a, Message> {
         if let Some(handle) = self.preview_images.get(&entry.handle) {
             Image::new(handle.clone())
-                .width(Length::Fixed(PREVIEW_WIDTH))
-                .height(Length::Fixed(PREVIEW_HEIGHT))
+                .width(Length::Fixed(width))
+                .height(Length::Fixed(height))
                 .content_fit(iced::ContentFit::Contain)
                 .into()
         } else {
@@ -462,14 +483,19 @@ impl MinimizedWindows {
                     .width(Length::Fixed(72.0))
                     .height(Length::Fixed(72.0)),
             )
-            .center_x(Length::Fixed(PREVIEW_WIDTH))
-            .center_y(Length::Fixed(PREVIEW_HEIGHT))
+            .center_x(Length::Fixed(width))
+            .center_y(Length::Fixed(height))
             .into()
         }
     }
 
-    fn window_preview_card<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
-        let visual = self.preview_visual(entry);
+    fn window_preview_card<'a>(
+        &self,
+        entry: &'a Entry,
+        width: f32,
+        height: f32,
+    ) -> cosmic::Element<'a, Message> {
+        let visual = self.preview_visual(entry, width, height);
         let image_button = cosmic::widget::button::custom_image_button(
             visual,
             Some(Message::CloseWindow(entry.handle.clone())),
@@ -482,7 +508,7 @@ impl MinimizedWindows {
             cosmic::widget::text(&entry.title).into(),
         ])
         .spacing(5.0)
-        .width(Length::Fixed(PREVIEW_WIDTH))
+        .width(Length::Fixed(width))
         .into()
     }
 
@@ -589,13 +615,18 @@ impl MinimizedWindows {
             cosmic::widget::text(format_time(media.length_us)).into(),
         ]);
 
+        let display_volume = if media.muted { 0.0 } else { media.volume };
         let volume_down = cosmic::widget::button::text("−")
             .on_press(Message::MediaControl(MediaUiAction::VolumeDown));
-        let mute = cosmic::widget::button::text(if media.volume <= 0.01 { "🔈" } else { "🔇" })
-            .on_press(Message::MediaControl(MediaUiAction::Mute));
+        let mute = cosmic::widget::button::text(if media.muted || media.volume <= 0.01 {
+            "🔈"
+        } else {
+            "🔇"
+        })
+        .on_press(Message::MediaControl(MediaUiAction::Mute));
         let volume_up = cosmic::widget::button::text("+")
             .on_press(Message::MediaControl(MediaUiAction::VolumeUp));
-        let volume_bar = cosmic::iced::widget::progress_bar(0.0..=1.5, media.volume as f32)
+        let volume_bar = cosmic::iced::widget::progress_bar(0.0..=1.5, display_volume as f32)
             .length(Length::Fixed(120.0))
             .girth(Length::Fixed(4.0));
         let volume = cosmic::widget::row::with_children(vec![
@@ -649,17 +680,37 @@ impl MinimizedWindows {
             children.push(media);
         }
 
+        let (preview_width, preview_height, columns) = Self::preview_dimensions(entries.len());
+        let grid_width = preview_width * columns as f32
+            + GROUP_GRID_GAP * columns.saturating_sub(1) as f32;
+        let rows = entries.len().div_ceil(columns);
+        let estimated_card_height = preview_height + 42.0;
+        let estimated_grid_height = estimated_card_height * rows as f32
+            + GROUP_GRID_GAP * rows.saturating_sub(1) as f32;
+        let viewport_height = estimated_grid_height
+            .min(GROUP_MAX_VIEWPORT_HEIGHT)
+            .max(1.0);
+
         let mut grid = cosmic::widget::grid::grid()
-            .column_spacing(12)
-            .row_spacing(12)
-            .max_width(PREVIEW_WIDTH * 2.0 + 12.0);
+            .column_spacing(GROUP_GRID_GAP as u16)
+            .row_spacing(GROUP_GRID_GAP as u16)
+            .max_width(grid_width);
         for (index, entry) in entries.iter().enumerate() {
-            grid = grid.push(self.window_preview_card(entry));
-            if (index + 1) % 2 == 0 {
+            grid = grid.push(self.window_preview_card(entry, preview_width, preview_height));
+            if (index + 1) % columns == 0 {
                 grid = grid.insert_row();
             }
         }
-        children.push(grid.into());
+
+        let grid_view: cosmic::Element<_> = if rows > 2 {
+            cosmic::widget::scrollable::vertical(grid)
+                .width(Length::Fixed(grid_width + 16.0))
+                .height(Length::Fixed(viewport_height))
+                .into()
+        } else {
+            grid.into()
+        };
+        children.push(grid_view);
 
         if entries.len() > MAX_PREVIEW_IMAGES {
             children.push(
@@ -818,32 +869,31 @@ impl cosmic::Application for MinimizedWindows {
                 if self.active_group.as_deref() == Some(group.as_str())
                     && self.preview_popup.is_some()
                 {
-                    return cosmic::task::none();
-                }
-                if self.popup_pinned && self.preview_popup.is_some() {
+                    if !self.popup_pinned {
+                        return self.refresh_open_group(&group);
+                    }
                     return cosmic::task::none();
                 }
 
-                let close = if self.preview_popup.is_some() {
-                    self.close_preview_surface()
-                } else {
-                    cosmic::task::none()
-                };
-                return Task::batch([close, Self::hover_delay_task(group, epoch)]);
+                // Pinned popups no longer globally disable hover. Keep the old popup
+                // visible during the delay and replace it only if this hover is still active.
+                return Self::hover_delay_task(group, epoch);
             }
             Message::GroupHoverExit(group) => {
                 if self.hover_group.as_deref() == Some(group.as_str()) {
                     self.hover_group = None;
                     self.hover_epoch = self.hover_epoch.wrapping_add(1);
                 }
-                if self.preview_popup.is_some() && !self.popup_pinned {
+                if self.preview_popup.is_some()
+                    && self.active_group.as_deref() == Some(group.as_str())
+                    && !self.popup_pinned
+                {
                     return self.schedule_close();
                 }
             }
             Message::HoverDelayElapsed(group, epoch) => {
                 if self.hover_epoch == epoch
                     && self.hover_group.as_deref() == Some(group.as_str())
-                    && !(self.popup_pinned && self.preview_popup.is_some())
                 {
                     return self.open_group(group, false);
                 }
@@ -938,6 +988,7 @@ impl cosmic::Application for MinimizedWindows {
                     return cosmic::task::none();
                 };
                 let bus_name = media.bus_name.clone();
+                let audio_stream_ids = media.audio_stream_ids.clone();
                 let command = match action {
                     MediaUiAction::Previous => MediaCommand::Previous,
                     MediaUiAction::PlayPause => MediaCommand::PlayPause,
@@ -949,18 +1000,20 @@ impl cosmic::Application for MinimizedWindows {
                         MediaCommand::SetVolume((media.volume + 0.05).min(1.5))
                     }
                     MediaUiAction::Mute => {
-                        if media.volume > 0.01 {
+                        if !media.muted && media.volume > 0.01 {
                             self.last_nonzero_volume = media.volume;
-                            MediaCommand::SetVolume(0.0)
-                        } else {
-                            MediaCommand::SetVolume(self.last_nonzero_volume.max(0.05))
+                        }
+                        MediaCommand::SetMuted {
+                            muted: !media.muted,
+                            restore_volume: self.last_nonzero_volume.max(0.05),
                         }
                     }
                 };
 
-                return Task::perform(media::command(bus_name, command), move |_| {
-                    cosmic::Action::App(Message::RefreshMedia(group))
-                });
+                return Task::perform(
+                    media::command(bus_name, audio_stream_ids, command),
+                    move |_| cosmic::Action::App(Message::RefreshMedia(group)),
+                );
             }
             Message::RefreshMedia(group) => {
                 if self.active_group.as_deref() == Some(group.as_str())
@@ -1019,6 +1072,15 @@ impl cosmic::Application for MinimizedWindows {
     fn on_close_requested(&self, id: WindowId) -> Option<Self::Message> {
         Some(Message::PreviewClosed(id))
     }
+}
+
+fn canonical_group_key(app_id: &str, app_label: &str) -> String {
+    let raw = if app_id.trim().is_empty() {
+        app_label.trim()
+    } else {
+        app_id.trim()
+    };
+    raw.trim_end_matches(".desktop").to_ascii_lowercase()
 }
 
 fn format_time(microseconds: i64) -> String {
