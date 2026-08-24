@@ -9,7 +9,7 @@ use tokio::{process::Command, time::timeout};
 use zbus::names::OwnedBusName;
 
 const MEDIA_TIMEOUT: Duration = Duration::from_millis(1800);
-const COMMAND_TIMEOUT: Duration = Duration::from_millis(1400);
+const COMMAND_TIMEOUT: Duration = Duration::from_millis(2200);
 const ART_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_QUERY_TIMEOUT: Duration = Duration::from_millis(850);
 const AUDIO_COMMAND_TIMEOUT: Duration = Duration::from_millis(650);
@@ -29,10 +29,10 @@ pub struct MediaSnapshot {
     pub playing: bool,
     pub volume: f64,
     pub muted: bool,
-    pub audio_stream_ids: Vec<u32>,
     pub can_previous: bool,
     pub can_next: bool,
-    pub can_play_pause: bool,
+    pub can_play: bool,
+    pub can_pause: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -45,10 +45,11 @@ pub struct MediaArtwork {
 #[derive(Clone, Debug)]
 pub enum MediaCommand {
     Previous,
-    PlayPause,
+    Play,
+    Pause,
     Next,
-    SetVolume(f64),
-    SetMuted { muted: bool, restore_volume: f64 },
+    VolumeDelta(f64),
+    ToggleMute { restore_volume: f64 },
 }
 
 #[derive(Debug)]
@@ -107,6 +108,15 @@ async fn snapshot_inner(
             .and_then(|metadata| metadata.title())
             .unwrap_or_default();
 
+        // Browsers can expose an MPRIS player for a tab that is unrelated to the
+        // minimized windows in this group. KDE's task manager applies the same idea:
+        // browser media is only useful when the track/title maps back to the window.
+        if looks_like_browser(app_id, app_label, &desktop_entry, &identity, bus_name.as_str())
+            && !browser_media_matches(&metadata_title, window_titles)
+        {
+            continue;
+        }
+
         let base_score = match_score(
             app_id,
             app_label,
@@ -155,19 +165,20 @@ async fn snapshot_inner(
     let artists = metadata.artists().unwrap_or_default().join(", ");
     let art_url = metadata.art_url();
     let mpris_volume = player.volume().await.unwrap_or(1.0).clamp(0.0, 1.5);
+    let can_control = player.can_control().await.unwrap_or(false);
     let can_previous = player.can_go_previous().await.unwrap_or(false);
     let can_next = player.can_go_next().await.unwrap_or(false);
-    let can_play_pause = player.can_control().await.unwrap_or(false)
-        && (player.can_play().await.unwrap_or(false) || player.can_pause().await.unwrap_or(false));
+    let can_play = can_control && player.can_play().await.unwrap_or(false);
+    let can_pause = can_control && player.can_pause().await.unwrap_or(false);
 
-    // Chromium-family browsers often expose MPRIS metadata/playback correctly but do not
-    // connect the MPRIS Volume property to the actual PipeWire/PulseAudio stream. Query
-    // the app's live sink-input once while the popup is open and prefer that volume.
+    // Query the actual audio stream only for the short-lived popup snapshot. The stream
+    // IDs are deliberately not stored in MediaSnapshot because Chromium/PipeWire may
+    // recreate them while the popup remains open.
     let audio = audio_state(app_id, app_label, &title).await;
-    let (volume, muted, audio_stream_ids) = if let Some(audio) = audio {
-        (audio.volume, audio.muted, audio.stream_ids)
+    let (volume, muted) = if let Some(audio) = audio {
+        (audio.volume, audio.muted)
     } else {
-        (mpris_volume, mpris_volume <= 0.01, Vec::new())
+        (mpris_volume, mpris_volume <= 0.01)
     };
 
     Some(MediaSnapshot {
@@ -181,17 +192,23 @@ async fn snapshot_inner(
         playing: status == PlaybackStatus::Playing,
         volume,
         muted,
-        audio_stream_ids,
         can_previous,
         can_next,
-        can_play_pause,
+        can_play,
+        can_pause,
     })
 }
 
-pub async fn command(bus_name: String, audio_stream_ids: Vec<u32>, command: MediaCommand) -> bool {
+pub async fn command(
+    bus_name: String,
+    app_id: String,
+    app_label: String,
+    media_title: String,
+    command: MediaCommand,
+) -> bool {
     timeout(
         COMMAND_TIMEOUT,
-        command_inner(bus_name, audio_stream_ids, command),
+        command_inner(bus_name, app_id, app_label, media_title, command),
     )
     .await
     .unwrap_or(false)
@@ -199,22 +216,30 @@ pub async fn command(bus_name: String, audio_stream_ids: Vec<u32>, command: Medi
 
 async fn command_inner(
     bus_name: String,
-    audio_stream_ids: Vec<u32>,
+    app_id: String,
+    app_label: String,
+    media_title: String,
     command: MediaCommand,
 ) -> bool {
-    let audio_handled = if audio_stream_ids.is_empty() {
-        false
-    } else {
-        match &command {
-            MediaCommand::SetVolume(volume) => set_audio_volume(&audio_stream_ids, *volume).await,
-            MediaCommand::SetMuted { muted, .. } => {
-                set_audio_muted(&audio_stream_ids, *muted).await
+    // Audio controls resolve the live PipeWire/PulseAudio stream at click time.
+    // Nothing long-lived is subscribed to or cached.
+    match &command {
+        MediaCommand::VolumeDelta(delta) => {
+            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await {
+                let target = (audio.volume + delta).clamp(0.0, 1.5);
+                if set_audio_volume(&audio.stream_ids, target).await {
+                    return true;
+                }
             }
-            _ => false,
         }
-    };
-    if audio_handled {
-        return true;
+        MediaCommand::ToggleMute { .. } => {
+            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await
+                && set_audio_muted(&audio.stream_ids, !audio.muted).await
+            {
+                return true;
+            }
+        }
+        _ => {}
     }
 
     let connection = match zbus::Connection::session().await {
@@ -232,20 +257,27 @@ async fn command_inner(
 
     match command {
         MediaCommand::Previous => player.previous().await.is_ok(),
-        MediaCommand::PlayPause => player.play_pause().await.is_ok(),
+        // Explicit Play/Pause calls are idempotent. A stale UI state can no longer
+        // invert the requested action as it could with PlayPause().
+        MediaCommand::Play => player.play().await.is_ok(),
+        MediaCommand::Pause => player.pause().await.is_ok(),
         MediaCommand::Next => player.next().await.is_ok(),
-        MediaCommand::SetVolume(volume) => player.set_volume(volume.clamp(0.0, 1.5)).await.is_ok(),
-        MediaCommand::SetMuted {
-            muted,
-            restore_volume,
-        } => player
-            .set_volume(if muted {
-                0.0
-            } else {
+        MediaCommand::VolumeDelta(delta) => {
+            let current = player.volume().await.unwrap_or(1.0);
+            player
+                .set_volume((current + delta).clamp(0.0, 1.5))
+                .await
+                .is_ok()
+        }
+        MediaCommand::ToggleMute { restore_volume } => {
+            let current = player.volume().await.unwrap_or(1.0);
+            let target = if current <= 0.01 {
                 restore_volume.clamp(0.05, 1.5)
-            })
-            .await
-            .is_ok(),
+            } else {
+                0.0
+            };
+            player.set_volume(target).await.is_ok()
+        }
     }
 }
 
@@ -292,7 +324,7 @@ async fn audio_state(app_id: &str, app_label: &str, media_title: &str) -> Option
     }
 
     let best_score = candidates.iter().map(|candidate| candidate.score).max()?;
-    let threshold = best_score.saturating_sub(4).max(8);
+    let threshold = best_score.saturating_sub(2).max(8);
     let selected = candidates
         .into_iter()
         .filter(|candidate| candidate.score >= threshold)
@@ -366,7 +398,7 @@ fn audio_match_score(
         && !media_norm.is_empty()
         && (media_norm.contains(&title_norm) || title_norm.contains(&media_norm))
     {
-        score += 8;
+        score += 10;
     }
     for token in tokens(media_title) {
         if media_norm.contains(&token) {
@@ -488,6 +520,54 @@ fn clamp_micros(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+fn looks_like_browser(app_id: &str, app_label: &str, desktop: &str, identity: &str, bus: &str) -> bool {
+    const BROWSERS: &[&str] = &[
+        "brave", "chromium", "chrome", "firefox", "vivaldi", "opera", "edge", "librewolf",
+        "zen",
+    ];
+    let haystack = format!(
+        "{}{}{}{}{}",
+        normalize(app_id),
+        normalize(app_label),
+        normalize(desktop),
+        normalize(identity),
+        normalize(bus)
+    );
+    BROWSERS.iter().any(|browser| haystack.contains(browser))
+}
+
+fn browser_media_matches(media_title: &str, window_titles: &[String]) -> bool {
+    let media_norm = normalize(media_title);
+    if media_norm.len() < 4 {
+        return false;
+    }
+
+    let media_tokens = tokens(media_title)
+        .into_iter()
+        .filter(|token| token.len() >= 4)
+        .collect::<Vec<_>>();
+
+    window_titles.iter().any(|window_title| {
+        let window_norm = normalize(window_title);
+        if window_norm.is_empty() {
+            return false;
+        }
+        if window_norm.contains(&media_norm) || media_norm.contains(&window_norm) {
+            return true;
+        }
+
+        let window_tokens = tokens(window_title);
+        let matches = media_tokens
+            .iter()
+            .filter(|token| window_tokens.contains(token))
+            .count();
+        matches >= 2
+            || (media_tokens.len() == 1
+                && media_tokens[0].len() >= 6
+                && window_tokens.contains(&media_tokens[0]))
+    })
+}
+
 fn match_score(
     app_id: &str,
     app_label: &str,
@@ -535,7 +615,7 @@ fn match_score(
             && !window_norm.is_empty()
             && (window_norm.contains(&media_norm) || media_norm.contains(&window_norm))
         {
-            score += 12;
+            score += 18;
             break;
         }
         for token in tokens(media_title) {
@@ -560,12 +640,18 @@ fn tokens(input: &str) -> Vec<String> {
     const STOP: &[&str] = &[
         "app",
         "application",
+        "brave",
+        "browser",
+        "chrome",
+        "chromium",
         "client",
         "com",
         "desktop",
+        "firefox",
         "github",
         "io",
         "org",
+        "youtube",
     ];
 
     input
