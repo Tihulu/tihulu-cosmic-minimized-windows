@@ -2,31 +2,68 @@
 
 A stability-focused minimized-window applet for the COSMIC desktop, licensed **AGPL-3.0-only**.
 
-It implements the familiar minimized-window dock behavior using COSMIC's public toplevel-management APIs, but intentionally does **not** capture live window thumbnails. Minimized windows are represented by their application icons; clicking an icon restores the window.
+It provides grouped minimized-window management, on-demand hover previews, per-window restore/close controls, and optional MPRIS media controls while deliberately bounding screenshot, memory, D-Bus, and artwork activity.
 
 ## Why this exists
 
-A system that motivated this project hit `Too many open files` in the COSMIC session, followed by Wayland/EGL failures and panel restart backoff. COSMIC has also had reports around the stock Minimized Windows applet and resource growth during window churn.
+A system that motivated this project hit `Too many open files` in the COSMIC session, followed by Wayland/EGL failures and panel restart backoff. COSMIC has also had reports around minimized-window screenshot/resource growth during window churn.
 
-This implementation avoids the whole screenshot path by design:
-
-- no screencopy sessions
-- no preview `memfd`
-- no thumbnail `wl_shm` buffers
-- no applet-created GPU synchronization FDs
-- no thumbnail worker thread per minimize event
-
-That does **not** claim to fix every possible COSMIC compositor/panel FD leak. It removes the minimized-window screenshot path from this applet so it can be tested independently.
+The goal here is not to claim that every COSMIC compositor or panel leak is fixed. Instead, this applet keeps its own expensive work short-lived and bounded so its resource behavior can be measured independently.
 
 ## Features
 
-- Shows currently minimized windows in the COSMIC dock or panel
-- Restores a window when its icon is clicked
-- Uses application icons and names from desktop entries
-- Supports horizontal and vertical panels/docks
-- Overflow popup when there are more minimized windows than fit inline
-- Removes window state immediately on restore/close
-- Keeps the applet alive if its Wayland bridge exits instead of intentionally panicking the panel process
+- Groups minimized windows from the same application under one dock icon
+- One minimized window: left click restores it directly
+- Multiple minimized windows: left click opens the group selector
+- Hover for about 350 ms opens the group preview
+- Right click opens and pins the group preview
+- Moving from the dock icon into the popup has a short grace period so the preview remains usable
+- Each window card is clickable to restore that exact window
+- Each window card has an **X** control to close that exact window
+- Multi-window preview uses a two-column layout
+- Browser previews show the current contents of that browser window
+- Supports horizontal and vertical COSMIC docks/panels
+
+### Media controls
+
+When the selected application exposes an MPRIS player, such as Spotify or other compatible media applications, the preview can show:
+
+- album artwork
+- track title and artist
+- previous / play-pause / next
+- playback progress and elapsed/total time
+- volume down / mute / volume up
+
+MPRIS integration is optional. If no matching player exists, the normal window previews continue to work.
+
+## Resource-safety design
+
+Resource lifetime is intentionally conservative because avoiding panel/session exhaustion is a primary design goal.
+
+### Window previews
+
+- no screenshot capture on minimize
+- no background thumbnail polling
+- no persistent thumbnail cache
+- at most **one screencopy capture in flight at a time**
+- live screenshot memory capped at **8 thumbnails per open group popup**
+- additional windows remain selectable using icon/title fallback
+- preview captures have a **2 second timeout**
+- `wl_buffer`, `wl_shm_pool`, screencopy frame/session, mmap, and memfd resources are released after each bounded capture
+- closing the popup immediately clears all retained preview image handles and pending preview state
+- stale capture results are discarded instead of becoming a long-lived cache
+
+### Media preview
+
+- no always-running MPRIS watcher
+- MPRIS is queried only while a relevant popup is open or immediately after a media-control action
+- playback progress uses a local **1 Hz UI tick** while playing; that tick does not take screenshots or issue repeated D-Bus queries
+- only one album-art image is retained for the currently open popup
+- remote/local album art is capped at **2 MiB** before decode and resized to at most **144 px**
+- album-art network/file operations have timeouts
+- media state and artwork are dropped when the popup closes
+
+These limits are intended to prevent the applet from recreating the unbounded `memfd`/screencopy-style accumulation that motivated the project. Real-session testing is still important, especially across different COSMIC and GPU-driver versions.
 
 ## One-line install
 
@@ -38,26 +75,36 @@ Then open **COSMIC Settings → Desktop → Dock** (or Panel), remove the stock 
 
 ## Verify resource behavior
 
-Watch the panel FD count while minimizing/restoring windows repeatedly:
+Because COSMIC can have more than one `cosmic-panel` process, inspect all of them rather than only the first PID:
 
 ```bash
-PID=$(pgrep -x cosmic-panel | head -1)
-watch -n 2 "printf 'panel FDs: '; ls /proc/$PID/fd 2>/dev/null | wc -l"
+for pid in $(pgrep -x cosmic-panel); do
+  printf 'PID=%-8s FD=%s\n' "$pid" "$(ls /proc/$pid/fd 2>/dev/null | wc -l)"
+done
 ```
 
-Find this applet and watch its FD count:
+Continuous view:
 
 ```bash
-PID=$(pgrep -f '/tihulu-cosmic-minimized-windows$' | head -1)
-watch -n 2 "printf 'applet FDs: '; ls /proc/$PID/fd 2>/dev/null | wc -l"
+watch -n 2 '
+for pid in $(pgrep -x cosmic-panel); do
+  printf "panel PID=%-8s FD=%s\n" "$pid" "$(ls /proc/$pid/fd 2>/dev/null | wc -l)"
+done
+pid=$(pgrep -f "/tihulu-cosmic-minimized-windows$" | head -1)
+[ -n "$pid" ] && printf "applet PID=%-8s FD=%s\n" "$pid" "$(ls /proc/$pid/fd 2>/dev/null | wc -l)"
+'
 ```
 
-Small fluctuations are normal. A monotonic increase tied to each minimize/restore cycle is not.
+Small temporary fluctuations while a preview is captured are expected. A monotonic increase tied to every hover/minimize/restore cycle is not.
+
+A useful stress test is to repeatedly minimize/restore windows and open/close hover previews while watching both the applet and all panel FD counts.
 
 ## Development
 
 ```bash
 cargo check
+cargo test
+cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
