@@ -212,8 +212,9 @@ impl CaptureContext {
             .checked_mul(4)?;
         let pool_len = i32::try_from(byte_len).ok()?;
 
-        let fd = rustix::fs::memfd_create(c"tihulu-minimized-preview", rustix::fs::MemfdFlags::CLOEXEC)
-            .ok()?;
+        let fd =
+            rustix::fs::memfd_create(c"tihulu-minimized-preview", rustix::fs::MemfdFlags::CLOEXEC)
+                .ok()?;
         rustix::fs::ftruncate(&fd, u64::try_from(byte_len).ok()?).ok()?;
 
         let pool = self.wl_shm.create_pool(fd.as_fd(), pool_len, &self.qh, ());
@@ -427,13 +428,7 @@ impl ScreencopyHandler for BridgeState {
         }
     }
 
-    fn ready(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        frame: &CaptureFrame,
-        _: Frame,
-    ) {
+    fn ready(&mut self, _: &Connection, _: &QueueHandle<Self>, frame: &CaptureFrame, _: Frame) {
         if let Some(data) = frame.data::<CaptureFrameData>() {
             data.waiter.finish(true);
         }
