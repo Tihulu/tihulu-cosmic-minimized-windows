@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    sync::LazyLock,
-    time::Duration,
-};
+use std::{borrow::Cow, collections::HashSet, sync::LazyLock, time::Duration};
 
 use cctk::toplevel_info::ToplevelInfo;
 use cosmic::{
@@ -335,8 +330,8 @@ impl MinimizedWindows {
         )
         .width(Length::Fill)
         .on_press(Message::Restore(entry.handle.clone()));
-        let close = cosmic::widget::button::text("×")
-            .on_press(Message::CloseWindow(entry.handle.clone()));
+        let close =
+            cosmic::widget::button::text("×").on_press(Message::CloseWindow(entry.handle.clone()));
 
         cosmic::widget::row::with_children(vec![restore.into(), close.into()])
             .spacing(6.0)
