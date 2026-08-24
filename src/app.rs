@@ -350,10 +350,10 @@ impl cosmic::Application for MinimizedWindows {
                         self.preview_image = image;
                     } else if let (Some(current), Some(tx)) =
                         (self.hovered.clone(), self.command_tx.as_ref())
+                        && self.preview_popup.is_some()
+                        && current != handle
                     {
-                        if self.preview_popup.is_some() && current != handle {
-                            let _ = tx.send(BridgeCommand::CapturePreview(current));
-                        }
+                        let _ = tx.send(BridgeCommand::CapturePreview(current));
                     }
                 }
             },
