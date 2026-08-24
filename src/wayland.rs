@@ -71,6 +71,7 @@ pub enum BridgeEvent {
 #[derive(Clone, Debug)]
 pub enum BridgeCommand {
     Restore(ExtForeignToplevelHandleV1),
+    Close(ExtForeignToplevelHandleV1),
     CapturePreview(ExtForeignToplevelHandleV1),
 }
 
@@ -535,6 +536,11 @@ fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Chann
                 let cosmic = state.cosmic_handle(&handle);
                 if let (Some(seat), Some(cosmic)) = (seat, cosmic) {
                     state.manager.manager.activate(&cosmic, &seat);
+                }
+            }
+            calloop::channel::Event::Msg(BridgeCommand::Close(handle)) => {
+                if let Some(cosmic) = state.cosmic_handle(&handle) {
+                    state.manager.manager.close(&cosmic);
                 }
             }
             calloop::channel::Event::Msg(BridgeCommand::CapturePreview(handle)) => {
