@@ -266,14 +266,16 @@ async fn command_inner(
         MediaCommand::Next => player.next().await.is_ok(),
         MediaCommand::SetVolume(volume) => player.set_volume(volume.clamp(0.0, 1.5)).await.is_ok(),
         MediaCommand::SetMuted {
-            muted: _,
+            muted,
             restore_volume,
         } => {
-            let current = player.volume().await.unwrap_or(1.0);
-            let target = if current <= 0.01 {
-                restore_volume.clamp(0.05, 1.5)
-            } else {
+            // MPRIS has no portable mute property. When PipeWire/PulseAudio stream
+            // matching is unavailable, honor the requested UI state by mapping mute to
+            // zero volume and unmute to the last known non-zero volume.
+            let target = if muted {
                 0.0
+            } else {
+                restore_volume.clamp(0.05, 1.5)
             };
             player.set_volume(target).await.is_ok()
         }
