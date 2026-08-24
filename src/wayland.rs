@@ -29,9 +29,9 @@ use cctk::{
     toplevel_info::{ToplevelInfo, ToplevelInfoHandler, ToplevelInfoState},
     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
     wayland_client::{
-        self, Connection, QueueHandle, WEnum, delegate_noop,
+        Connection, QueueHandle, WEnum, delegate_noop,
         globals::registry_queue_init,
-        protocol::{wl_buffer, wl_seat::WlSeat, wl_shm},
+        protocol::{wl_buffer, wl_seat::WlSeat, wl_shm, wl_shm_pool},
     },
     wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
 };
@@ -380,6 +380,7 @@ impl SeatHandler for BridgeState {
     }
 
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+
     fn new_capability(
         &mut self,
         _: &Connection,
@@ -388,6 +389,7 @@ impl SeatHandler for BridgeState {
         _: sctk::seat::Capability,
     ) {
     }
+
     fn remove_capability(
         &mut self,
         _: &Connection,
@@ -396,6 +398,7 @@ impl SeatHandler for BridgeState {
         _: sctk::seat::Capability,
     ) {
     }
+
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
 }
 
@@ -580,3 +583,4 @@ cctk::delegate_toplevel_info!(BridgeState);
 cctk::delegate_toplevel_manager!(BridgeState);
 cctk::delegate_screencopy!(BridgeState);
 delegate_noop!(BridgeState: ignore wl_buffer::WlBuffer);
+delegate_noop!(BridgeState: ignore wl_shm_pool::WlShmPool);
