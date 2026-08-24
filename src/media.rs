@@ -65,7 +65,10 @@ fn fetch_for_app_blocking(app_id: &str, app_label: &str) -> Option<MediaState> {
         if score <= 0 {
             continue;
         }
-        if best.as_ref().is_none_or(|(best_score, _)| score > *best_score) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
             best = Some((score, player));
         }
     }
@@ -73,7 +76,11 @@ fn fetch_for_app_blocking(app_id: &str, app_label: &str) -> Option<MediaState> {
     let (_, player) = best?;
     let metadata = player.get_metadata().ok()?;
     let duration = metadata.length().unwrap_or_default();
-    let position = player.checked_get_position().ok().flatten().unwrap_or_default();
+    let position = player
+        .checked_get_position()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let volume = player.checked_get_volume().ok().flatten();
     let status = player.get_playback_status().ok();
 
@@ -230,12 +237,7 @@ fn load_album_art(art_url: &str) -> Option<MediaArt> {
         let scale = ART_MAX_SIDE as f64 / f64::from(max_side);
         let width = (f64::from(image.width()) * scale).round().max(1.0) as u32;
         let height = (f64::from(image.height()) * scale).round().max(1.0) as u32;
-        image::imageops::resize(
-            &image,
-            width,
-            height,
-            image::imageops::FilterType::Triangle,
-        )
+        image::imageops::resize(&image, width, height, image::imageops::FilterType::Triangle)
     } else {
         image
     };

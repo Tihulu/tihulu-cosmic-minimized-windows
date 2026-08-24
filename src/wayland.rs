@@ -368,18 +368,15 @@ impl BridgeState {
         }
     }
 
-    fn begin_preview_batch(
-        &mut self,
-        generation: u64,
-        handles: Vec<ExtForeignToplevelHandleV1>,
-    ) {
+    fn begin_preview_batch(&mut self, generation: u64, handles: Vec<ExtForeignToplevelHandleV1>) {
         self.capture_generation.store(generation, Ordering::Release);
         if let Ok(mut queue) = self.capture_queue.lock() {
             queue.clear();
-            queue.extend(handles.into_iter().map(|handle| CaptureJob {
-                generation,
-                handle,
-            }));
+            queue.extend(
+                handles
+                    .into_iter()
+                    .map(|handle| CaptureJob { generation, handle }),
+            );
         }
         self.ensure_capture_worker();
     }

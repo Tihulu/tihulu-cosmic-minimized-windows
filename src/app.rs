@@ -293,7 +293,11 @@ impl MinimizedWindows {
         group_key: &'a str,
         group_index: usize,
     ) -> cosmic::Element<'a, Message> {
-        let Some(entry) = self.windows.iter().find(|entry| entry.group_key == group_key) else {
+        let Some(entry) = self
+            .windows
+            .iter()
+            .find(|entry| entry.group_key == group_key)
+        else {
             return cosmic::widget::space::horizontal().into();
         };
 
@@ -485,12 +489,7 @@ impl MinimizedWindows {
         )
     }
 
-    fn media_debounce_task(
-        epoch: u64,
-        bus: String,
-        value: f64,
-        is_volume: bool,
-    ) -> Task<Message> {
+    fn media_debounce_task(epoch: u64, bus: String, value: f64, is_volume: bool) -> Task<Message> {
         Task::perform(
             async move {
                 tokio::time::sleep(MEDIA_DEBOUNCE).await;
@@ -507,7 +506,8 @@ impl MinimizedWindows {
     }
 
     fn preview_visual<'a>(&'a self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
-        let visual: cosmic::Element<_> = if let Some(image) = self.preview_images.get(&entry.handle) {
+        let visual: cosmic::Element<_> = if let Some(image) = self.preview_images.get(&entry.handle)
+        {
             Image::new(Handle::from_rgba(
                 image.width,
                 image.height,
@@ -556,28 +556,21 @@ impl MinimizedWindows {
         .align_y(Alignment::Center)
         .width(Length::Fixed(PREVIEW_WIDTH));
 
-        cosmic::widget::column::with_children(vec![
-            self.preview_visual(entry),
-            title_row.into(),
-        ])
-        .spacing(6.0)
-        .width(Length::Fixed(PREVIEW_WIDTH))
-        .into()
+        cosmic::widget::column::with_children(vec![self.preview_visual(entry), title_row.into()])
+            .spacing(6.0)
+            .width(Length::Fixed(PREVIEW_WIDTH))
+            .into()
     }
 
     fn media_panel(&self) -> Option<cosmic::Element<'_, Message>> {
         let media = self.media.as_ref()?;
 
         let art: cosmic::Element<_> = if let Some(art) = media.art.as_ref() {
-            Image::new(Handle::from_rgba(
-                art.width,
-                art.height,
-                art.rgba.clone(),
-            ))
-            .width(Length::Fixed(96.0))
-            .height(Length::Fixed(96.0))
-            .content_fit(iced::ContentFit::Cover)
-            .into()
+            Image::new(Handle::from_rgba(art.width, art.height, art.rgba.clone()))
+                .width(Length::Fixed(96.0))
+                .height(Length::Fixed(96.0))
+                .content_fit(iced::ContentFit::Cover)
+                .into()
         } else {
             cosmic::widget::container(
                 cosmic::widget::icon::from_name("audio-x-generic-symbolic")
@@ -646,13 +639,10 @@ impl MinimizedWindows {
             next
         };
 
-        let controls = cosmic::widget::row::with_children(vec![
-            previous.into(),
-            play.into(),
-            next.into(),
-        ])
-        .spacing(8.0)
-        .align_y(Alignment::Center);
+        let controls =
+            cosmic::widget::row::with_children(vec![previous.into(), play.into(), next.into()])
+                .spacing(8.0)
+                .align_y(Alignment::Center);
 
         let progress = if media.duration_us > 0 {
             (media.position_us as f64 / media.duration_us as f64).clamp(0.0, 1.0)
@@ -684,11 +674,8 @@ impl MinimizedWindows {
         .spacing(10.0)
         .align_y(Alignment::Center);
 
-        let mut children: Vec<cosmic::Element<_>> = vec![
-            header.into(),
-            controls.into(),
-            progress_row.into(),
-        ];
+        let mut children: Vec<cosmic::Element<_>> =
+            vec![header.into(), controls.into(), progress_row.into()];
 
         if let Some(volume) = media.volume {
             let volume_row = cosmic::widget::row::with_children(vec![
@@ -759,14 +746,20 @@ impl MinimizedWindows {
     }
 
     fn context_restore(&mut self, group: usize, window: usize) -> Task<Message> {
-        let Some(handle) = self.entry_at(group, window).map(|entry| entry.handle.clone()) else {
+        let Some(handle) = self
+            .entry_at(group, window)
+            .map(|entry| entry.handle.clone())
+        else {
             return cosmic::task::none();
         };
         self.restore(handle)
     }
 
     fn context_close(&mut self, group: usize, window: usize) {
-        let Some(handle) = self.entry_at(group, window).map(|entry| entry.handle.clone()) else {
+        let Some(handle) = self
+            .entry_at(group, window)
+            .map(|entry| entry.handle.clone())
+        else {
             return;
         };
         if let Some(tx) = &self.command_tx {
@@ -816,9 +809,11 @@ impl cosmic::Application for MinimizedWindows {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        let mut subscriptions = vec![wayland::subscription().map(|event| Message::Bridge(Box::new(event)))];
+        let mut subscriptions =
+            vec![wayland::subscription().map(|event| Message::Bridge(Box::new(event)))];
         if self.preview_popup.is_some() && self.media.as_ref().is_some_and(|media| media.playing) {
-            subscriptions.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::MediaTick));
+            subscriptions
+                .push(iced::time::every(Duration::from_secs(1)).map(|_| Message::MediaTick));
         }
         Subscription::batch(subscriptions)
     }
@@ -875,9 +870,9 @@ impl cosmic::Application for MinimizedWindows {
                     if generation == self.preview_generation
                         && self.preview_popup.is_some()
                         && self.active_group.as_ref().is_some_and(|group| {
-                            self.windows.iter().any(|entry| {
-                                &entry.group_key == group && entry.handle == handle
-                            })
+                            self.windows
+                                .iter()
+                                .any(|entry| &entry.group_key == group && entry.handle == handle)
                         })
                     {
                         if let Some(image) = image {
@@ -913,9 +908,7 @@ impl cosmic::Application for MinimizedWindows {
                 self.hover_epoch = self.hover_epoch.wrapping_add(1);
                 self.close_epoch = self.close_epoch.wrapping_add(1);
                 let epoch = self.hover_epoch;
-                if self.preview_popup.is_some()
-                    && self.active_group.as_ref() == Some(&group_key)
-                {
+                if self.preview_popup.is_some() && self.active_group.as_ref() == Some(&group_key) {
                     return cosmic::task::none();
                 }
                 return Self::hover_delay_task(group_key, epoch);
@@ -932,9 +925,7 @@ impl cosmic::Application for MinimizedWindows {
                 }
             }
             Message::HoverDelayElapsed(group_key, epoch) => {
-                if self.hover_epoch == epoch
-                    && self.dock_hovered.as_ref() == Some(&group_key)
-                {
+                if self.hover_epoch == epoch && self.dock_hovered.as_ref() == Some(&group_key) {
                     return self.activate_group(group_key);
                 }
             }
