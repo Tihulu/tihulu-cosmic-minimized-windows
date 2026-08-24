@@ -879,8 +879,8 @@ impl cosmic::Application for MinimizedWindows {
             Message::HoverDelayElapsed(group, epoch) => {
                 if self.hover_epoch == epoch && self.hover_group.as_deref() == Some(group.as_str())
                 {
-                    let keep_pinned = self.popup_pinned
-                        && self.active_group.as_deref() == Some(group.as_str());
+                    let keep_pinned =
+                        self.popup_pinned && self.active_group.as_deref() == Some(group.as_str());
                     return self.open_group(group, keep_pinned);
                 }
             }

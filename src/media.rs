@@ -106,8 +106,13 @@ async fn snapshot_inner(
             .and_then(|metadata| metadata.title())
             .unwrap_or_default();
 
-        if looks_like_browser(app_id, app_label, &desktop_entry, &identity, bus_name.as_str())
-            && !browser_media_matches(&metadata_title, window_titles)
+        if looks_like_browser(
+            app_id,
+            app_label,
+            &desktop_entry,
+            &identity,
+            bus_name.as_str(),
+        ) && !browser_media_matches(&metadata_title, window_titles)
         {
             continue;
         }
@@ -514,9 +519,22 @@ fn clamp_micros(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-fn looks_like_browser(app_id: &str, app_label: &str, desktop: &str, identity: &str, bus: &str) -> bool {
+fn looks_like_browser(
+    app_id: &str,
+    app_label: &str,
+    desktop: &str,
+    identity: &str,
+    bus: &str,
+) -> bool {
     const BROWSERS: &[&str] = &[
-        "brave", "chromium", "chrome", "firefox", "vivaldi", "opera", "edge", "librewolf",
+        "brave",
+        "chromium",
+        "chrome",
+        "firefox",
+        "vivaldi",
+        "opera",
+        "edge",
+        "librewolf",
         "zen",
     ];
     let haystack = format!(
