@@ -11,11 +11,7 @@ use cosmic::{
         wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
     },
     desktop::{IconSourceExt, fde},
-    iced::{
-        self, Length, Limits, Subscription,
-        id::Id as WidgetId,
-        window::Id as WindowId,
-    },
+    iced::{self, Length, Limits, Subscription, id::Id as WidgetId, window::Id as WindowId},
     widget::{Image, autosize::autosize, image::Handle},
 };
 
@@ -104,7 +100,11 @@ impl MinimizedWindows {
             info.title.trim().to_owned()
         };
 
-        if let Some(index) = self.windows.iter().position(|window| window.handle == handle) {
+        if let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.handle == handle)
+        {
             self.windows[index] = Entry {
                 handle,
                 info,
