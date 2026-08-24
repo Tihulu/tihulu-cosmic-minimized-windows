@@ -16,7 +16,8 @@ use std::{
 };
 
 use cctk::wayland_client::{
-    Connection, QueueHandle, WEnum, delegate_noop, globals::registry_queue_init,
+    Connection, QueueHandle, WEnum, delegate_noop,
+    globals::registry_queue_init,
     protocol::{wl_buffer, wl_seat::WlSeat, wl_shm, wl_shm_pool},
 };
 use cctk::{
@@ -238,11 +239,9 @@ impl CaptureContext {
             return None;
         }
 
-        let fd = rustix::fs::memfd_create(
-            c"tihulu-minimized-preview",
-            rustix::fs::MemfdFlags::CLOEXEC,
-        )
-        .ok()?;
+        let fd =
+            rustix::fs::memfd_create(c"tihulu-minimized-preview", rustix::fs::MemfdFlags::CLOEXEC)
+                .ok()?;
         rustix::fs::ftruncate(&fd, u64::from(buffer_len)).ok()?;
 
         let pool = self
@@ -459,7 +458,8 @@ impl BridgeState {
     }
 
     fn capture_finished(&mut self, result: CaptureWorkerResult) {
-        let is_current = self.capture_running.as_ref().map(|job| job.token) == Some(result.job.token);
+        let is_current =
+            self.capture_running.as_ref().map(|job| job.token) == Some(result.job.token);
         if is_current {
             self.capture_running = None;
             self.capture_cancel = None;
@@ -543,13 +543,7 @@ impl ScreencopyHandler for BridgeState {
         }
     }
 
-    fn ready(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        frame: &CaptureFrame,
-        _: Frame,
-    ) {
+    fn ready(&mut self, _: &Connection, _: &QueueHandle<Self>, frame: &CaptureFrame, _: Frame) {
         if let Some(data) = frame.data::<PreviewFrameData>() {
             data.wait.set_result(true);
         }
