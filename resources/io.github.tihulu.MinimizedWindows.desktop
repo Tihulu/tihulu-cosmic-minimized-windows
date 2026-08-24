@@ -1,0 +1,16 @@
+[Desktop Entry]
+Name=Tihulu Minimized Windows
+Comment=Manage minimized windows with a stability-focused icon-only implementation
+Type=Application
+Exec=tihulu-cosmic-minimized-windows
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Minimize;Windows;
+Icon=preferences-system-windows-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-MinimizeApplet=10
+X-HostWaylandDisplay=true
+X-OverflowPriority=50
+X-OverflowMinSize=2
