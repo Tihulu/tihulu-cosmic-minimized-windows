@@ -17,9 +17,7 @@ use cctk::{
     toplevel_info::{ToplevelInfo, ToplevelInfoHandler, ToplevelInfoState},
     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
     wayland_client::{
-        Connection, QueueHandle,
-        globals::registry_queue_init,
-        protocol::wl_seat::WlSeat,
+        Connection, QueueHandle, WEnum, globals::registry_queue_init, protocol::wl_seat::WlSeat,
     },
     wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
 };
@@ -222,8 +220,6 @@ impl ToplevelManagerHandler for BridgeState {
     ) {
     }
 }
-
-use cctk::wayland_client::WEnum;
 
 fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Channel<BridgeCommand>) {
     let privileged = std::env::var("X_PRIVILEGED_WAYLAND_SOCKET")
