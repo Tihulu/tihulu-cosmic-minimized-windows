@@ -690,8 +690,7 @@ impl MinimizedWindows {
         let estimated_card_height = preview_height + 42.0;
         let estimated_grid_height =
             estimated_card_height * rows as f32 + GROUP_GRID_GAP * rows.saturating_sub(1) as f32;
-        let viewport_height =
-            estimated_grid_height.clamp(1.0, GROUP_MAX_VIEWPORT_HEIGHT);
+        let viewport_height = estimated_grid_height.clamp(1.0, GROUP_MAX_VIEWPORT_HEIGHT);
 
         let mut grid = cosmic::widget::grid::grid()
             .column_spacing(GROUP_GRID_GAP as u16)
