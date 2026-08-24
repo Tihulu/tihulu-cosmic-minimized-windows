@@ -91,11 +91,11 @@ async fn snapshot_inner(app_id: &str, app_label: &str) -> Option<MediaSnapshot> 
         .await
         .ok()
         .flatten()
-        .map(|duration| duration.as_micros())
+        .map(|duration| clamp_micros(duration.as_micros()))
         .unwrap_or_default();
     let length_us = metadata
         .length()
-        .map(|duration| duration.as_micros())
+        .map(|duration| clamp_micros(duration.as_micros()))
         .unwrap_or_default();
     let title = metadata.title().unwrap_or_else(|| identity.clone());
     let artists = metadata.artists().unwrap_or_default().join(", ");
@@ -201,6 +201,10 @@ async fn load_art_inner(url: &str) -> Option<MediaArtwork> {
         height: thumbnail.height(),
         rgba: thumbnail.into_raw(),
     })
+}
+
+fn clamp_micros(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 fn match_score(app_id: &str, app_label: &str, bus: &str, identity: &str, desktop: &str) -> usize {
