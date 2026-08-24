@@ -4,7 +4,6 @@ use std::borrow::Cow;
 
 use cctk::toplevel_info::ToplevelInfo;
 use cosmic::{
-    app,
     applet::cosmic_panel_config::PanelAnchor,
     cctk::{
         sctk::reexports::calloop,
@@ -29,6 +28,7 @@ struct Entry {
     icon: fde::IconSource,
 }
 
+#[derive(Default)]
 struct MinimizedWindows {
     core: cosmic::app::Core,
     language: Vec<String>,
@@ -38,22 +38,9 @@ struct MinimizedWindows {
     overflow: Option<Id>,
 }
 
-impl Default for MinimizedWindows {
-    fn default() -> Self {
-        Self {
-            core: cosmic::app::Core::default(),
-            language: Vec::new(),
-            desktop_entries: Vec::new(),
-            windows: Vec::new(),
-            command_tx: None,
-            overflow: None,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 enum Message {
-    Bridge(BridgeEvent),
+    Bridge(Box<BridgeEvent>),
     Restore(ExtForeignToplevelHandleV1),
     ToggleOverflow,
     OverflowClosed(Id),
@@ -68,10 +55,12 @@ impl MinimizedWindows {
 
     fn app_visuals(&mut self, app_id: &str) -> (String, fde::IconSource) {
         let key = fde::unicase::Ascii::new(app_id);
-        let found = fde::find_app_by_id(&self.desktop_entries, key).cloned().or_else(|| {
-            self.reload_desktop_entries();
-            fde::find_app_by_id(&self.desktop_entries, key).cloned()
-        });
+        let found = fde::find_app_by_id(&self.desktop_entries, key)
+            .cloned()
+            .or_else(|| {
+                self.reload_desktop_entries();
+                fde::find_app_by_id(&self.desktop_entries, key).cloned()
+            });
 
         if let Some(entry) = found {
             let label = entry
@@ -196,10 +185,7 @@ impl cosmic::Application for MinimizedWindows {
         let mut app = Self {
             core,
             language: fde::get_languages_from_env(),
-            desktop_entries: Vec::new(),
-            windows: Vec::new(),
-            command_tx: None,
-            overflow: None,
+            ..Default::default()
         };
         app.reload_desktop_entries();
 
@@ -219,42 +205,46 @@ impl cosmic::Application for MinimizedWindows {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        wayland::subscription().map(Message::Bridge)
+        wayland::subscription().map(|event| Message::Bridge(Box::new(event)))
     }
 
     fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
         match message {
-            Message::Bridge(BridgeEvent::Ready(tx)) => {
-                self.command_tx = Some(tx);
-            }
-            Message::Bridge(BridgeEvent::Stopped) => {
-                self.command_tx = None;
-                tracing::error!("Minimized-window Wayland bridge stopped");
-            }
-            Message::Bridge(BridgeEvent::Window(WindowDelta::Present(info))) => {
-                let was_empty = self.windows.is_empty();
-                self.upsert(info);
-                if was_empty && !self.windows.is_empty() {
-                    return cosmic::iced::window::maximize(
-                        self.core.main_window_id().unwrap(),
-                        true,
-                    );
+            Message::Bridge(event) => match *event {
+                BridgeEvent::Ready(tx) => {
+                    self.command_tx = Some(tx);
                 }
-            }
-            Message::Bridge(BridgeEvent::Window(WindowDelta::Gone(handle))) => {
-                self.remove(&handle);
-                if self.windows.is_empty() {
-                    let hide = cosmic::iced::window::minimize(
-                        self.core.main_window_id().unwrap(),
-                        true,
-                    );
-                    if let Some(id) = self.overflow.take() {
-                        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
-                        return cosmic::app::Task::batch([destroy_popup(id), hide]);
+                BridgeEvent::Stopped => {
+                    self.command_tx = None;
+                    tracing::error!("Minimized-window Wayland bridge stopped");
+                }
+                BridgeEvent::Window(delta) => match *delta {
+                    WindowDelta::Present(info) => {
+                        let was_empty = self.windows.is_empty();
+                        self.upsert(*info);
+                        if was_empty && !self.windows.is_empty() {
+                            return cosmic::iced::window::maximize(
+                                self.core.main_window_id().unwrap(),
+                                true,
+                            );
+                        }
                     }
-                    return hide;
-                }
-            }
+                    WindowDelta::Gone(handle) => {
+                        self.remove(&handle);
+                        if self.windows.is_empty() {
+                            let hide = cosmic::iced::window::minimize(
+                                self.core.main_window_id().unwrap(),
+                                true,
+                            );
+                            if let Some(id) = self.overflow.take() {
+                                use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
+                                return cosmic::app::Task::batch([destroy_popup(id), hide]);
+                            }
+                            return hide;
+                        }
+                    }
+                },
+            },
             Message::Restore(handle) => {
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(BridgeCommand::Restore(handle));
