@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   format:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -19,52 +18,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Fix probe proc scan
+      - name: Harden probe proc scan
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('src/bin/tihulu-preview-probe.rs')
+          p = Path("src/bin/tihulu-preview-probe.rs")
           s = p.read_text()
-          old = '''fn pid_by_comm(name: &str) -> Option<u32> {
-    for entry in fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
-        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-        if comm.trim() == name {
-            return Some(pid);
-        }
-    }
-    None
-}
-'''
-          new = '''fn pid_by_comm(name: &str) -> Option<u32> {
-    let entries = fs::read_dir("/proc").ok()?;
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
-            continue;
-        };
-        if comm.trim() == name {
-            return Some(pid);
-        }
-    }
-    None
-}
-'''
-          if old not in s:
-              raise SystemExit('expected pid_by_comm source not found')
-          p.write_text(s.replace(old, new))
+          start = s.index("fn pid_by_comm(name: &str) -> Option<u32> {")
+          end = s.index("\nfn proc_metrics", start)
+          replacement = """fn pid_by_comm(name: &str) -> Option<u32> {
+              let entries = fs::read_dir(\"/proc\").ok()?;
+              for entry in entries {
+                  let Ok(entry) = entry else {
+                      continue;
+                  };
+                  let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                      continue;
+                  };
+                  let Ok(comm) = fs::read_to_string(format!(\"/proc/{pid}/comm\")) else {
+                      continue;
+                  };
+                  if comm.trim() == name {
+                      return Some(pid);
+                  }
+              }
+              None
+          }
+          """
+          p.write_text(s[:start] + replacement + s[end + 1:])
           PY
       - name: Rustfmt
         run: cargo fmt --all
-      - name: Commit maintenance output
+      - name: Commit source maintenance
         run: |
-          if git diff --quiet; then
+          if git diff --quiet -- src; then
             exit 0
           fi
           git config user.name github-actions[bot]
