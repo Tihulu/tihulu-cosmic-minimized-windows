@@ -202,11 +202,7 @@ impl MinimizedWindows {
             .collect()
     }
 
-    fn group_contains_handle(
-        &self,
-        group: &str,
-        handle: &ExtForeignToplevelHandleV1,
-    ) -> bool {
+    fn group_contains_handle(&self, group: &str, handle: &ExtForeignToplevelHandleV1) -> bool {
         self.windows
             .iter()
             .any(|entry| entry.group_key == group && &entry.handle == handle)
@@ -558,16 +554,22 @@ impl MinimizedWindows {
             .spacing(12.0)
             .align_y(iced::Alignment::Center);
 
-        let previous = cosmic::widget::button::text("⏮")
-            .on_press_maybe(media.can_previous.then_some(Message::MediaControl(
-                MediaUiAction::Previous,
-            )));
+        let previous = cosmic::widget::button::text("⏮").on_press_maybe(
+            media
+                .can_previous
+                .then_some(Message::MediaControl(MediaUiAction::Previous)),
+        );
         let play_pause = cosmic::widget::button::text(if media.playing { "⏸" } else { "▶" })
-            .on_press_maybe(media.can_play_pause.then_some(Message::MediaControl(
-                MediaUiAction::PlayPause,
-            )));
-        let next = cosmic::widget::button::text("⏭")
-            .on_press_maybe(media.can_next.then_some(Message::MediaControl(MediaUiAction::Next)));
+            .on_press_maybe(
+                media
+                    .can_play_pause
+                    .then_some(Message::MediaControl(MediaUiAction::PlayPause)),
+            );
+        let next = cosmic::widget::button::text("⏭").on_press_maybe(
+            media
+                .can_next
+                .then_some(Message::MediaControl(MediaUiAction::Next)),
+        );
         let controls = cosmic::widget::row::with_children(vec![
             previous.into(),
             play_pause.into(),
@@ -581,7 +583,9 @@ impl MinimizedWindows {
             .girth(Length::Fixed(4.0));
         let times = cosmic::widget::row::with_children(vec![
             cosmic::widget::text(format_time(position)).into(),
-            cosmic::widget::space::horizontal().width(Length::Fill).into(),
+            cosmic::widget::space::horizontal()
+                .width(Length::Fill)
+                .into(),
             cosmic::widget::text(format_time(media.length_us)).into(),
         ]);
 
@@ -748,7 +752,8 @@ impl cosmic::Application for MinimizedWindows {
                         self.preview_queue.retain(|queued| queued != &handle);
 
                         let group_disappeared = removed_group.as_deref().is_some_and(|group| {
-                            self.active_group.as_deref() == Some(group) && self.group_count(group) == 0
+                            self.active_group.as_deref() == Some(group)
+                                && self.group_count(group) == 0
                         });
                         let close = if group_disappeared {
                             self.close_preview_surface()
@@ -919,8 +924,8 @@ impl cosmic::Application for MinimizedWindows {
                     && self.media_art_url.as_deref() == Some(url.as_str())
                 {
                     self.media_art = artwork.map(|artwork| {
-                        let artwork = Arc::try_unwrap(artwork)
-                            .unwrap_or_else(|artwork| (*artwork).clone());
+                        let artwork =
+                            Arc::try_unwrap(artwork).unwrap_or_else(|artwork| (*artwork).clone());
                         Handle::from_rgba(artwork.width, artwork.height, artwork.rgba)
                     });
                 }
