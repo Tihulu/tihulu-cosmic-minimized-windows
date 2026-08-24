@@ -19,7 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Apply bounded playback sync and mute cleanup
+      - name: Apply bounded media fixes
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -27,13 +27,69 @@ jobs:
           media = Path('src/media.rs')
           s = media.read_text()
 
+          s = s.replace('    SetVolume(f64),', '    AdjustVolume(f64),')
           s = s.replace(
               '    SetMuted { muted: bool, restore_volume: f64 },',
-              '    SetMuted { restore_volume: f64 },',
+              '    ToggleMute { restore_volume: f64 },',
+          )
+
+          old = '''        MediaCommand::SetVolume(target) => {
+            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await
+                && set_audio_volume(&audio.stream_ids, *target).await
+            {
+                return true;
+            }
+        }
+        MediaCommand::SetMuted { .. } => {
+            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await
+                && set_audio_muted(&audio.stream_ids, !audio.muted).await
+            {
+                return true;
+            }
+        }
+'''
+          new = '''        MediaCommand::AdjustVolume(delta) => {
+            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await {
+                let target = (audio.volume + *delta).clamp(0.0, 1.5);
+                if set_audio_volume(&audio.stream_ids, target).await {
+                    return true;
+                }
+            }
+        }
+        MediaCommand::ToggleMute { .. } => {
+            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await
+                && set_audio_muted(&audio.stream_ids, !audio.muted).await
+            {
+                return true;
+            }
+        }
+'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          s = s.replace(
+              '        MediaCommand::SetVolume(volume) => player.set_volume(volume.clamp(0.0, 1.5)).await.is_ok(),',
+              '''        MediaCommand::AdjustVolume(delta) => {
+            let current = player.volume().await.unwrap_or(1.0);
+            player
+                .set_volume((current + delta).clamp(0.0, 1.5))
+                .await
+                .is_ok()
+        }''',
+              1,
           )
           s = s.replace(
-              '        MediaCommand::SetMuted {\n            muted: _,\n            restore_volume,\n        } => {',
+              '''        MediaCommand::SetMuted {
+            muted: _,
+            restore_volume,
+        } => {''',
+              '        MediaCommand::ToggleMute { restore_volume } => {',
+              1,
+          )
+          s = s.replace(
               '        MediaCommand::SetMuted { restore_volume } => {',
+              '        MediaCommand::ToggleMute { restore_volume } => {',
+              1,
           )
 
           marker = 'pub async fn command(\n'
@@ -63,25 +119,36 @@ jobs:
           app = Path('src/app.rs')
           s = app.read_text()
 
-          s = s.replace(
-              '    media_loaded_at: Option<Instant>,\n    media_art_url:',
-              '    media_loaded_at: Option<Instant>,\n    media_status_inflight: bool,\n    media_art_url:',
-              1,
-          )
-          s = s.replace(
-              '    MediaLoaded(String, Option<Box<MediaSnapshot>>),\n    MediaArtworkLoaded',
-              '    MediaLoaded(String, Option<Box<MediaSnapshot>>),\n    MediaStatusLoaded(String, String, Option<bool>),\n    MediaArtworkLoaded',
-              1,
-          )
-          s = s.replace(
-              '        self.media_loaded_at = None;\n        self.media_art_url = None;',
-              '        self.media_loaded_at = None;\n        self.media_status_inflight = false;\n        self.media_art_url = None;',
-              1,
-          )
+          if 'media_status_inflight: bool' not in s:
+              s = s.replace(
+                  '    media_loaded_at: Option<Instant>,\n    media_art_url:',
+                  '    media_loaded_at: Option<Instant>,\n    media_status_inflight: bool,\n    media_art_url:',
+                  1,
+              )
+          if 'MediaStatusLoaded(String, String, Option<bool>)' not in s:
+              s = s.replace(
+                  '    MediaLoaded(String, Option<Box<MediaSnapshot>>),\n    MediaArtworkLoaded',
+                  '    MediaLoaded(String, Option<Box<MediaSnapshot>>),\n    MediaStatusLoaded(String, String, Option<bool>),\n    MediaArtworkLoaded',
+                  1,
+              )
+          if 'self.media_status_inflight = false;' not in s.split('fn clear_popup_state',1)[0]:
+              s = s.replace(
+                  '        self.media_loaded_at = None;\n        self.media_art_url = None;',
+                  '        self.media_loaded_at = None;\n        self.media_status_inflight = false;\n        self.media_art_url = None;',
+                  1,
+              )
           s = s.replace(
               '        if self.preview_popup.is_some() && self.media.as_ref().is_some_and(|media| media.playing) {',
               '        if self.preview_popup.is_some() && self.media.is_some() {',
               1,
+          )
+          s = s.replace(
+              'MediaCommand::SetVolume((media.volume - 0.05).max(0.0))',
+              'MediaCommand::AdjustVolume(-0.05)',
+          )
+          s = s.replace(
+              'MediaCommand::SetVolume((media.volume + 0.05).min(1.5))',
+              'MediaCommand::AdjustVolume(0.05)',
           )
           s = s.replace(
               '''                        MediaCommand::SetMuted {
@@ -89,15 +156,16 @@ jobs:
                             restore_volume: self.last_nonzero_volume.max(0.05),
                         }
 ''',
-              '''                        MediaCommand::SetMuted {
+              '''                        MediaCommand::ToggleMute {
                             restore_volume: self.last_nonzero_volume.max(0.05),
                         }
 ''',
               1,
           )
+          s = s.replace('MediaCommand::SetMuted {', 'MediaCommand::ToggleMute {')
 
-          old = '            Message::MediaTick => {}\n'
-          new = '''            Message::MediaStatusLoaded(group, bus_name, playing) => {
+          old_tick = '            Message::MediaTick => {}\n'
+          new_tick = '''            Message::MediaStatusLoaded(group, bus_name, playing) => {
                 self.media_status_inflight = false;
                 if self.active_group.as_deref() != Some(group.as_str())
                     || self.preview_popup.is_none()
@@ -143,9 +211,9 @@ jobs:
             }
 '''
           if 'Message::MediaStatusLoaded(group, bus_name, playing)' not in s:
-              if old not in s:
+              if old_tick not in s:
                   raise SystemExit('MediaTick marker not found')
-              s = s.replace(old, new, 1)
+              s = s.replace(old_tick, new_tick, 1)
 
           app.write_text(s)
           PY
