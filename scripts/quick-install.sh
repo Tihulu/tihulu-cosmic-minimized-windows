@@ -27,13 +27,13 @@ trap cleanup EXIT
 
 install_deps() {
   if ! need apt-get; then
-    warn "apt-get not found. Install the COSMIC/libcosmic build dependencies manually."
+    warn "apt-get not found. Install the COSMIC/libcosmic build dependencies and pactl manually."
     return
   fi
-  log "Installing build dependencies"
+  log "Installing build and media-control dependencies"
   sudo apt-get update
   sudo apt-get install -y \
-    build-essential cmake curl git \
+    build-essential cmake curl git pulseaudio-utils \
     libegl1-mesa-dev libexpat1-dev libfontconfig-dev libfreetype-dev \
     libwayland-dev libxkbcommon-dev pkgconf
 }
