@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     os::{
         fd::{AsFd, FromRawFd, RawFd},
         unix::net::UnixStream,
@@ -9,7 +9,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -64,20 +64,31 @@ pub enum WindowDelta {
 pub enum BridgeEvent {
     Ready(calloop::channel::Sender<BridgeCommand>),
     Window(Box<WindowDelta>),
-    Preview(ExtForeignToplevelHandleV1, Option<PreviewImage>),
+    Preview {
+        generation: u64,
+        handle: ExtForeignToplevelHandleV1,
+        image: Option<PreviewImage>,
+    },
     Stopped,
 }
 
 #[derive(Clone, Debug)]
 pub enum BridgeCommand {
     Restore(ExtForeignToplevelHandleV1),
-    CapturePreview(ExtForeignToplevelHandleV1),
+    Close(ExtForeignToplevelHandleV1),
+    BeginPreviewBatch {
+        generation: u64,
+        handles: Vec<ExtForeignToplevelHandleV1>,
+    },
+    CancelPreviews {
+        generation: u64,
+    },
 }
 
 pub fn subscription() -> Subscription<BridgeEvent> {
     Subscription::run_with(std::any::TypeId::of::<BridgeEvent>(), |_| {
         stream::channel(
-            8,
+            32,
             move |mut output: futures::channel::mpsc::Sender<BridgeEvent>| async move {
                 let (command_tx, command_rx) = calloop::channel::channel();
                 let runtime = tokio::runtime::Handle::current();
@@ -280,6 +291,12 @@ impl CaptureContext {
     }
 }
 
+#[derive(Clone)]
+struct CaptureJob {
+    generation: u64,
+    handle: ExtForeignToplevelHandleV1,
+}
+
 struct BridgeState {
     done: bool,
     out: mpsc::Sender<BridgeEvent>,
@@ -293,6 +310,8 @@ struct BridgeState {
     connection: Connection,
     shown: HashSet<ExtForeignToplevelHandleV1>,
     capture_busy: Arc<AtomicBool>,
+    capture_generation: Arc<AtomicU64>,
+    capture_queue: Arc<Mutex<VecDeque<CaptureJob>>>,
 }
 
 impl BridgeState {
@@ -342,7 +361,30 @@ impl BridgeState {
         }
     }
 
-    fn request_preview(&mut self, handle: ExtForeignToplevelHandleV1) {
+    fn cancel_previews(&mut self, generation: u64) {
+        self.capture_generation.store(generation, Ordering::Release);
+        if let Ok(mut queue) = self.capture_queue.lock() {
+            queue.clear();
+        }
+    }
+
+    fn begin_preview_batch(
+        &mut self,
+        generation: u64,
+        handles: Vec<ExtForeignToplevelHandleV1>,
+    ) {
+        self.capture_generation.store(generation, Ordering::Release);
+        if let Ok(mut queue) = self.capture_queue.lock() {
+            queue.clear();
+            queue.extend(handles.into_iter().map(|handle| CaptureJob {
+                generation,
+                handle,
+            }));
+        }
+        self.ensure_capture_worker();
+    }
+
+    fn ensure_capture_worker(&mut self) {
         if self.capture_busy.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -354,14 +396,40 @@ impl BridgeState {
             capturer: self.screencopy.capturer().clone(),
         };
         let busy = self.capture_busy.clone();
+        let generation = self.capture_generation.clone();
+        let queue = self.capture_queue.clone();
         let mut out = self.out.clone();
 
         std::thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| context.capture(handle.clone())))
-                .ok()
-                .flatten();
-            busy.store(false, Ordering::Release);
-            let _ = futures::executor::block_on(out.send(BridgeEvent::Preview(handle, result)));
+            loop {
+                let job = queue.lock().ok().and_then(|mut jobs| jobs.pop_front());
+                let Some(job) = job else {
+                    busy.store(false, Ordering::Release);
+
+                    let has_more = queue.lock().is_ok_and(|jobs| !jobs.is_empty());
+                    if !has_more || busy.swap(true, Ordering::AcqRel) {
+                        break;
+                    }
+                    continue;
+                };
+
+                if job.generation != generation.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                let handle = job.handle.clone();
+                let image = catch_unwind(AssertUnwindSafe(|| context.capture(handle.clone())))
+                    .ok()
+                    .flatten();
+
+                if job.generation == generation.load(Ordering::Acquire) {
+                    let _ = futures::executor::block_on(out.send(BridgeEvent::Preview {
+                        generation: job.generation,
+                        handle,
+                        image,
+                    }));
+                }
+            }
         });
     }
 }
@@ -537,8 +605,19 @@ fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Chann
                     state.manager.manager.activate(&cosmic, &seat);
                 }
             }
-            calloop::channel::Event::Msg(BridgeCommand::CapturePreview(handle)) => {
-                state.request_preview(handle);
+            calloop::channel::Event::Msg(BridgeCommand::Close(handle)) => {
+                if let Some(cosmic) = state.cosmic_handle(&handle) {
+                    state.manager.manager.close(&cosmic);
+                }
+            }
+            calloop::channel::Event::Msg(BridgeCommand::BeginPreviewBatch {
+                generation,
+                handles,
+            }) => {
+                state.begin_preview_batch(generation, handles);
+            }
+            calloop::channel::Event::Msg(BridgeCommand::CancelPreviews { generation }) => {
+                state.cancel_previews(generation);
             }
             calloop::channel::Event::Closed => state.done = true,
         })
@@ -566,6 +645,8 @@ fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Chann
         registry,
         shown: HashSet::new(),
         capture_busy: Arc::new(AtomicBool::new(false)),
+        capture_generation: Arc::new(AtomicU64::new(0)),
+        capture_queue: Arc::new(Mutex::new(VecDeque::new())),
     };
 
     while !state.done {
