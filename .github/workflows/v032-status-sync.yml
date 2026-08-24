@@ -1,4 +1,4 @@
-name: Apply v0.3.2 media state sync
+name: Apply v0.3.2 final source patch
 
 on:
   push:
@@ -19,13 +19,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Apply bounded media status refresh
+      - name: Apply bounded playback sync and mute cleanup
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
           media = Path('src/media.rs')
           s = media.read_text()
+
+          s = s.replace(
+              '    SetMuted { muted: bool, restore_volume: f64 },',
+              '    SetMuted { restore_volume: f64 },',
+          )
+          s = s.replace(
+              '        MediaCommand::SetMuted {\n            muted: _,\n            restore_volume,\n        } => {',
+              '        MediaCommand::SetMuted { restore_volume } => {',
+          )
+
           marker = 'pub async fn command(\n'
           insert = '''pub async fn playback_state(bus_name: String) -> Option<bool> {
               timeout(Duration::from_millis(700), async move {
@@ -44,11 +54,15 @@ jobs:
 
           '''
           if 'pub async fn playback_state(' not in s:
+              if marker not in s:
+                  raise SystemExit('media command marker not found')
               s = s.replace(marker, insert + marker, 1)
+
           media.write_text(s)
 
           app = Path('src/app.rs')
           s = app.read_text()
+
           s = s.replace(
               '    media_loaded_at: Option<Instant>,\n    media_art_url:',
               '    media_loaded_at: Option<Instant>,\n    media_status_inflight: bool,\n    media_art_url:',
@@ -69,8 +83,20 @@ jobs:
               '        if self.preview_popup.is_some() && self.media.is_some() {',
               1,
           )
-          old = '''            Message::MediaTick => {}
-'''
+          s = s.replace(
+              '''                        MediaCommand::SetMuted {
+                            muted: !media.muted,
+                            restore_volume: self.last_nonzero_volume.max(0.05),
+                        }
+''',
+              '''                        MediaCommand::SetMuted {
+                            restore_volume: self.last_nonzero_volume.max(0.05),
+                        }
+''',
+              1,
+          )
+
+          old = '            Message::MediaTick => {}\n'
           new = '''            Message::MediaStatusLoaded(group, bus_name, playing) => {
                 self.media_status_inflight = false;
                 if self.active_group.as_deref() != Some(group.as_str())
@@ -116,16 +142,22 @@ jobs:
                 });
             }
 '''
-          if old not in s:
-              raise SystemExit('MediaTick marker not found')
-          s = s.replace(old, new, 1)
+          if 'Message::MediaStatusLoaded(group, bus_name, playing)' not in s:
+              if old not in s:
+                  raise SystemExit('MediaTick marker not found')
+              s = s.replace(old, new, 1)
+
           app.write_text(s)
           PY
           cargo fmt --all
       - name: Commit changes
         run: |
+          if git diff --quiet; then
+            echo 'No source changes needed'
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/app.rs src/media.rs
-          git commit -m 'Sync visible media playback state while popup is open'
+          git commit -m 'Finalize bounded media state handling for v0.3.2'
           git push origin HEAD:v0.3.2-popup-hover-browser-audio
