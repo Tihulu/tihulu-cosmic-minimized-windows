@@ -34,7 +34,7 @@ install_deps() {
   sudo apt-get update
   sudo apt-get install -y \
     build-essential cmake curl git \
-    libegl1-mesa-dev libexpat1-dev libfontconfig-dev libfreetype-dev \
+    libdbus-1-dev libegl1-mesa-dev libexpat1-dev libfontconfig-dev libfreetype-dev \
     libwayland-dev libxkbcommon-dev pkgconf
 }
 
