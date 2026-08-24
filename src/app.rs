@@ -148,6 +148,7 @@ impl MinimizedWindows {
             },
         )
         .snap_within_viewport(false)
+        .into()
     }
 
     fn overflow_task(&mut self) -> cosmic::app::Task<Message> {
