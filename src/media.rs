@@ -188,11 +188,7 @@ async fn snapshot_inner(
     })
 }
 
-pub async fn command(
-    bus_name: String,
-    audio_stream_ids: Vec<u32>,
-    command: MediaCommand,
-) -> bool {
+pub async fn command(bus_name: String, audio_stream_ids: Vec<u32>, command: MediaCommand) -> bool {
     timeout(
         COMMAND_TIMEOUT,
         command_inner(bus_name, audio_stream_ids, command),
@@ -310,7 +306,10 @@ async fn audio_state(app_id: &str, app_label: &str, media_title: &str) -> Option
         .sum::<f64>()
         / selected.len() as f64;
     let muted = selected.iter().all(|candidate| candidate.muted);
-    let stream_ids = selected.into_iter().map(|candidate| candidate.index).collect();
+    let stream_ids = selected
+        .into_iter()
+        .map(|candidate| candidate.index)
+        .collect();
 
     Some(AudioState {
         stream_ids,
@@ -377,7 +376,10 @@ fn audio_match_score(
 }
 
 fn property<'a>(properties: &'a Map<String, Value>, key: &str) -> &'a str {
-    properties.get(key).and_then(Value::as_str).unwrap_or_default()
+    properties
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 async fn set_audio_volume(stream_ids: &[u32], volume: f64) -> bool {
