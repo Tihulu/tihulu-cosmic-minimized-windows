@@ -146,10 +146,6 @@ impl MinimizedWindows {
         group
     }
 
-    fn group_entry(&self, group: &str) -> Option<&Entry> {
-        self.windows.iter().find(|entry| entry.group_key == group)
-    }
-
     fn group_count(&self, group: &str) -> usize {
         self.windows
             .iter()
