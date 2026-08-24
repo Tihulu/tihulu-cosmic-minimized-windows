@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{borrow::Cow, collections::HashSet, sync::LazyLock, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+    time::Duration,
+};
 
 use cctk::toplevel_info::ToplevelInfo;
 use cosmic::{
@@ -12,13 +17,22 @@ use cosmic::{
     },
     desktop::{IconSourceExt, fde},
     iced::{self, Length, Limits, Subscription, id::Id as WidgetId, window::Id as WindowId},
-    widget::autosize::autosize,
+    widget::{
+        autosize::autosize,
+        rectangle_tracker::{RectangleTracker, RectangleUpdate, rectangle_tracker_subscription},
+    },
 };
 
-use crate::wayland::{self, BridgeCommand, BridgeEvent, WindowDelta};
+use crate::{
+    config::{self, RunMode},
+    wayland::{self, BridgeCommand, BridgeEvent, WindowDelta},
+};
 
 const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
+const REARM_DELAY: Duration = Duration::from_millis(32);
+const ANCHOR_RETRY_DELAY: Duration = Duration::from_millis(16);
+const ANCHOR_RETRY_MAX: u8 = 4;
 const POPUP_WIDTH: f32 = 340.0;
 const POPUP_MAX_HEIGHT: f32 = 420.0;
 const ROW_HEIGHT_ESTIMATE: f32 = 52.0;
@@ -48,14 +62,19 @@ struct MinimizedWindows {
     hover_group: Option<String>,
     active_group: Option<String>,
     close_epoch: u64,
+    open_epoch: u64,
     popup_hovered: bool,
     popup_pinned: bool,
     group_popup: Option<WindowId>,
+    rectangle_tracker: Option<RectangleTracker<u64>>,
+    rectangles: HashMap<u64, iced::Rectangle>,
+    mode: RunMode,
 }
 
 #[derive(Clone, Debug)]
 enum Message {
     Bridge(Box<BridgeEvent>),
+    Rectangle(RectangleUpdate<u64>),
     GroupPrimary(String),
     GroupOpen(String),
     GroupHoverEnter(String),
@@ -63,6 +82,18 @@ enum Message {
     PopupEnter,
     PopupExit,
     CloseDelayElapsed(u64),
+    ReopenAfterDestroy {
+        epoch: u64,
+        group: String,
+        pinned: bool,
+    },
+    OpenRetry {
+        epoch: u64,
+        group: String,
+        pinned: bool,
+        attempt: u8,
+    },
+    ToggleSafeMode,
     Restore(ExtForeignToplevelHandleV1),
     CloseWindow(ExtForeignToplevelHandleV1),
     PopupClosed(WindowId),
@@ -213,7 +244,17 @@ impl MinimizedWindows {
             .into()
     }
 
-    fn popup_anchor_rect(&self, group: &str) -> iced::Rectangle<i32> {
+    fn tracked_anchor_rect(&self, group: &str) -> Option<iced::Rectangle<i32>> {
+        let rectangle = self.rectangles.get(&tracker_id(group))?;
+        Some(iced::Rectangle {
+            x: rectangle.x.round() as i32,
+            y: rectangle.y.round() as i32,
+            width: rectangle.width.round().max(1.0) as i32,
+            height: rectangle.height.round().max(1.0) as i32,
+        })
+    }
+
+    fn fallback_anchor_rect(&self, group: &str) -> iced::Rectangle<i32> {
         let index = self.group_index(group);
         let (icon_width, icon_height) = self.core.applet.suggested_size(false);
         let (major, minor) = self.core.applet.suggested_padding(false);
@@ -248,9 +289,38 @@ impl MinimizedWindows {
         }
     }
 
-    fn create_popup(&mut self, group: &str) -> Task<Message> {
+    fn create_popup(&mut self, group: String, pinned: bool, attempt: u8) -> Task<Message> {
         use cosmic::iced::platform_specific::shell::commands::popup::get_popup;
 
+        if self.group_count(&group) == 0 {
+            return cosmic::task::none();
+        }
+
+        let anchor = if let Some(anchor) = self.tracked_anchor_rect(&group) {
+            anchor
+        } else if attempt < ANCHOR_RETRY_MAX {
+            let epoch = self.open_epoch;
+            return Task::perform(
+                async move {
+                    tokio::time::sleep(ANCHOR_RETRY_DELAY).await;
+                    (epoch, group, pinned, attempt + 1)
+                },
+                |(epoch, group, pinned, attempt)| {
+                    cosmic::Action::App(Message::OpenRetry {
+                        epoch,
+                        group,
+                        pinned,
+                        attempt,
+                    })
+                },
+            );
+        } else {
+            tracing::warn!(%group, "RectangleTracker was not ready; using fallback popup anchor");
+            self.fallback_anchor_rect(&group)
+        };
+
+        self.active_group = Some(group);
+        self.popup_pinned = pinned;
         let id = WindowId::unique();
         self.group_popup = Some(id);
         let mut settings = self.core.applet.get_popup_settings(
@@ -260,7 +330,7 @@ impl MinimizedWindows {
             None,
             None,
         );
-        settings.positioner.anchor_rect = self.popup_anchor_rect(group);
+        settings.positioner.anchor_rect = anchor;
         get_popup(settings)
     }
 
@@ -270,6 +340,7 @@ impl MinimizedWindows {
         }
 
         self.close_epoch = self.close_epoch.wrapping_add(1);
+        self.open_epoch = self.open_epoch.wrapping_add(1);
         self.active_group = Some(group.clone());
         self.popup_hovered = false;
         if pinned {
@@ -278,19 +349,48 @@ impl MinimizedWindows {
             self.popup_pinned = false;
         }
 
-        // Stability-first rule: while a popup surface exists, reuse it and only replace
-        // its contents. Avoiding destroy/recreate/reposition churn makes hover independent
-        // of compositor popup-lifetime races.
         if self.group_popup.is_some() {
             cosmic::task::none()
         } else {
-            self.create_popup(&group)
+            self.create_popup(group, pinned, 0)
         }
+    }
+
+    fn rearm_popup(&mut self, group: String, pinned: bool) -> Task<Message> {
+        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
+
+        self.close_epoch = self.close_epoch.wrapping_add(1);
+        self.open_epoch = self.open_epoch.wrapping_add(1);
+        let epoch = self.open_epoch;
+        self.active_group = None;
+        self.popup_hovered = false;
+        self.popup_pinned = pinned;
+
+        let destroy = self
+            .group_popup
+            .take()
+            .map(destroy_popup)
+            .unwrap_or_else(cosmic::task::none);
+        let reopen = Task::perform(
+            async move {
+                tokio::time::sleep(REARM_DELAY).await;
+                (epoch, group, pinned)
+            },
+            |(epoch, group, pinned)| {
+                cosmic::Action::App(Message::ReopenAfterDestroy {
+                    epoch,
+                    group,
+                    pinned,
+                })
+            },
+        );
+        Task::batch([destroy, reopen])
     }
 
     fn close_popup(&mut self) -> Task<Message> {
         use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
 
+        self.open_epoch = self.open_epoch.wrapping_add(1);
         self.active_group = None;
         self.hover_group = None;
         self.popup_hovered = false;
@@ -374,9 +474,28 @@ impl MinimizedWindows {
             list.into()
         };
 
-        let content = cosmic::widget::column::with_children(vec![header.into(), list])
-            .spacing(9.0)
-            .width(Length::Fixed(POPUP_WIDTH));
+        let mode_label = if self.mode.is_safe() {
+            "Safe mode: ON"
+        } else {
+            "Enhanced mode: requested"
+        };
+        let mode_button = cosmic::widget::button::text(mode_label)
+            .on_press(Message::ToggleSafeMode)
+            .width(Length::Fill);
+        let mode_note = if self.mode.is_safe() {
+            "No thumbnails or media helpers"
+        } else {
+            "Daemon features only; safe fallback stays available"
+        };
+
+        let content = cosmic::widget::column::with_children(vec![
+            header.into(),
+            list,
+            mode_button.into(),
+            cosmic::widget::text(mode_note).into(),
+        ])
+        .spacing(9.0)
+        .width(Length::Fixed(POPUP_WIDTH));
 
         cosmic::widget::mouse_area(content)
             .on_enter(Message::PopupEnter)
@@ -396,6 +515,7 @@ impl cosmic::Application for MinimizedWindows {
         let mut app = Self {
             core,
             language: fde::get_languages_from_env(),
+            mode: config::load_mode(),
             ..Default::default()
         };
         app.reload_desktop_entries();
@@ -416,7 +536,10 @@ impl cosmic::Application for MinimizedWindows {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        wayland::subscription().map(|event| Message::Bridge(Box::new(event)))
+        Subscription::batch([
+            wayland::subscription().map(|event| Message::Bridge(Box::new(event))),
+            rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
+        ])
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
@@ -461,6 +584,14 @@ impl cosmic::Application for MinimizedWindows {
                     }
                 },
             },
+            Message::Rectangle(update) => match update {
+                RectangleUpdate::Rectangle((id, rectangle)) => {
+                    self.rectangles.insert(id, rectangle);
+                }
+                RectangleUpdate::Init(tracker) => {
+                    self.rectangle_tracker = Some(tracker);
+                }
+            },
             Message::GroupPrimary(group) => {
                 let handles = self.group_handles(&group);
                 if handles.len() == 1 {
@@ -470,11 +601,17 @@ impl cosmic::Application for MinimizedWindows {
                     return self.close_popup();
                 }
                 if !handles.is_empty() {
+                    if self.group_popup.is_some() {
+                        return self.rearm_popup(group, true);
+                    }
                     return self.open_group(group, true);
                 }
             }
             Message::GroupOpen(group) => {
                 if self.group_count(&group) > 0 {
+                    if self.group_popup.is_some() {
+                        return self.rearm_popup(group, true);
+                    }
                     return self.open_group(group, true);
                 }
             }
@@ -482,6 +619,11 @@ impl cosmic::Application for MinimizedWindows {
                 self.close_epoch = self.close_epoch.wrapping_add(1);
                 self.hover_group = Some(group.clone());
                 if !self.popup_pinned {
+                    // A fresh pointer enter is also a health signal. Re-arm any old
+                    // unpinned popup surface instead of trusting a stale compositor object.
+                    if self.group_popup.is_some() {
+                        return self.rearm_popup(group, false);
+                    }
                     return self.open_group(group, false);
                 }
             }
@@ -512,6 +654,38 @@ impl cosmic::Application for MinimizedWindows {
                     return self.close_popup();
                 }
             }
+            Message::ReopenAfterDestroy {
+                epoch,
+                group,
+                pinned,
+            } => {
+                if self.open_epoch == epoch
+                    && self.group_count(&group) > 0
+                    && (pinned || self.hover_group.as_deref() == Some(group.as_str()))
+                {
+                    return self.create_popup(group, pinned, 0);
+                }
+            }
+            Message::OpenRetry {
+                epoch,
+                group,
+                pinned,
+                attempt,
+            } => {
+                if self.open_epoch == epoch
+                    && self.group_popup.is_none()
+                    && self.group_count(&group) > 0
+                    && (pinned || self.hover_group.as_deref() == Some(group.as_str()))
+                {
+                    return self.create_popup(group, pinned, attempt);
+                }
+            }
+            Message::ToggleSafeMode => {
+                self.mode = self.mode.toggled();
+                if let Err(error) = config::save_mode(self.mode) {
+                    tracing::warn!(?error, "Could not save minimized-windows mode");
+                }
+            }
             Message::Restore(handle) => {
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(BridgeCommand::Restore(handle));
@@ -530,6 +704,7 @@ impl cosmic::Application for MinimizedWindows {
                     self.hover_group = None;
                     self.popup_hovered = false;
                     self.popup_pinned = false;
+                    self.open_epoch = self.open_epoch.wrapping_add(1);
                 }
             }
         }
@@ -543,7 +718,14 @@ impl cosmic::Application for MinimizedWindows {
             .windows
             .iter()
             .filter(|entry| seen.insert(entry.group_key.as_str()))
-            .map(|entry| self.group_button(entry, self.group_count(&entry.group_key)))
+            .map(|entry| {
+                let button = self.group_button(entry, self.group_count(&entry.group_key));
+                if let Some(tracker) = self.rectangle_tracker.as_ref() {
+                    tracker.container(tracker_id(&entry.group_key), button).into()
+                } else {
+                    button
+                }
+            })
             .collect::<Vec<_>>();
 
         let content: cosmic::Element<_> = if self.core.applet.is_horizontal() {
@@ -581,6 +763,17 @@ impl cosmic::Application for MinimizedWindows {
     fn on_close_requested(&self, id: WindowId) -> Option<Self::Message> {
         Some(Message::PopupClosed(id))
     }
+}
+
+fn tracker_id(group: &str) -> u64 {
+    // Stable FNV-1a is enough for widget tracking and avoids storing String IDs in the
+    // rectangle tracker. A collision would only affect popup positioning for that session.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in group.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn canonical_group_key(app_id: &str, app_label: &str) -> String {
