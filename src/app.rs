@@ -4,7 +4,7 @@ use std::{borrow::Cow, sync::LazyLock, time::Duration};
 
 use cctk::toplevel_info::ToplevelInfo;
 use cosmic::{
-    Task,
+    app::Task,
     applet::cosmic_panel_config::PanelAnchor,
     cctk::{
         sctk::reexports::calloop,
@@ -31,7 +31,6 @@ pub(crate) fn run() -> cosmic::iced::Result {
 
 struct Entry {
     handle: ExtForeignToplevelHandleV1,
-    info: ToplevelInfo,
     app_label: String,
     title: String,
     icon: fde::IconSource,
@@ -100,26 +99,21 @@ impl MinimizedWindows {
             info.title.trim().to_owned()
         };
 
+        let entry = Entry {
+            handle: handle.clone(),
+            app_label,
+            title,
+            icon,
+        };
+
         if let Some(index) = self
             .windows
             .iter()
             .position(|window| window.handle == handle)
         {
-            self.windows[index] = Entry {
-                handle,
-                info,
-                app_label,
-                title,
-                icon,
-            };
+            self.windows[index] = entry;
         } else {
-            self.windows.push(Entry {
-                handle,
-                info,
-                app_label,
-                title,
-                icon,
-            });
+            self.windows.push(entry);
         }
     }
 
@@ -158,6 +152,7 @@ impl MinimizedWindows {
         let Some(id) = self.preview_popup.take() else {
             return cosmic::task::none();
         };
+
         use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
         destroy_popup(id)
     }
@@ -204,9 +199,10 @@ impl MinimizedWindows {
     fn open_preview_surface(&mut self, handle: &ExtForeignToplevelHandleV1) -> Task<Message> {
         use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
 
-        let old = self.preview_popup.take();
+        let previous = self.preview_popup.take();
         let id = WindowId::unique();
         self.preview_popup = Some(id);
+
         let mut settings = self.core.applet.get_popup_settings(
             self.core.main_window_id().unwrap(),
             id,
@@ -217,8 +213,8 @@ impl MinimizedWindows {
         settings.positioner.anchor_rect = self.preview_anchor_rect(handle);
         let open = get_popup(settings);
 
-        if let Some(old) = old {
-            Task::batch([destroy_popup(old), open])
+        if let Some(previous) = previous {
+            Task::batch([destroy_popup(previous), open])
         } else {
             open
         }
@@ -230,7 +226,7 @@ impl MinimizedWindows {
                 tokio::time::sleep(HOVER_DELAY).await;
                 (handle, epoch)
             },
-            |(handle, epoch)| Message::HoverDelayElapsed(handle, epoch),
+            |(handle, epoch)| cosmic::Action::App(Message::HoverDelayElapsed(handle, epoch)),
         )
     }
 
