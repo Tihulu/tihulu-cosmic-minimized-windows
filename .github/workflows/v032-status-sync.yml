@@ -1,0 +1,131 @@
+name: Apply v0.3.2 media state sync
+
+on:
+  push:
+    branches:
+      - v0.3.2-popup-hover-browser-audio
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.3.2-popup-hover-browser-audio
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply bounded media status refresh
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          media = Path('src/media.rs')
+          s = media.read_text()
+          marker = 'pub async fn command(\n'
+          insert = '''pub async fn playback_state(bus_name: String) -> Option<bool> {
+              timeout(Duration::from_millis(700), async move {
+                  let connection = zbus::Connection::session().await.ok()?;
+                  let name = OwnedBusName::try_from(bus_name).ok()?;
+                  let player = mpris2_zbus::player::Player::new(&connection, name).await.ok()?;
+                  match player.playback_status().await.ok()? {
+                      PlaybackStatus::Playing => Some(true),
+                      PlaybackStatus::Paused | PlaybackStatus::Stopped => Some(false),
+                  }
+              })
+              .await
+              .ok()
+              .flatten()
+          }
+
+          '''
+          if 'pub async fn playback_state(' not in s:
+              s = s.replace(marker, insert + marker, 1)
+          media.write_text(s)
+
+          app = Path('src/app.rs')
+          s = app.read_text()
+          s = s.replace(
+              '    media_loaded_at: Option<Instant>,\n    media_art_url:',
+              '    media_loaded_at: Option<Instant>,\n    media_status_inflight: bool,\n    media_art_url:',
+              1,
+          )
+          s = s.replace(
+              '    MediaLoaded(String, Option<Box<MediaSnapshot>>),\n    MediaArtworkLoaded',
+              '    MediaLoaded(String, Option<Box<MediaSnapshot>>),\n    MediaStatusLoaded(String, String, Option<bool>),\n    MediaArtworkLoaded',
+              1,
+          )
+          s = s.replace(
+              '        self.media_loaded_at = None;\n        self.media_art_url = None;',
+              '        self.media_loaded_at = None;\n        self.media_status_inflight = false;\n        self.media_art_url = None;',
+              1,
+          )
+          s = s.replace(
+              '        if self.preview_popup.is_some() && self.media.as_ref().is_some_and(|media| media.playing) {',
+              '        if self.preview_popup.is_some() && self.media.is_some() {',
+              1,
+          )
+          old = '''            Message::MediaTick => {}
+'''
+          new = '''            Message::MediaStatusLoaded(group, bus_name, playing) => {
+                self.media_status_inflight = false;
+                if self.active_group.as_deref() != Some(group.as_str())
+                    || self.preview_popup.is_none()
+                {
+                    return cosmic::task::none();
+                }
+
+                let Some(new_playing) = playing else {
+                    return cosmic::task::none();
+                };
+                let Some(current) = self.media.as_ref() else {
+                    return cosmic::task::none();
+                };
+                if current.bus_name != bus_name || current.playing == new_playing {
+                    return cosmic::task::none();
+                }
+
+                let position = self.media_progress(current).1;
+                if let Some(current) = self.media.as_mut()
+                    && current.bus_name == bus_name
+                {
+                    current.position_us = position;
+                    current.playing = new_playing;
+                    self.media_loaded_at = Some(Instant::now());
+                }
+            }
+            Message::MediaTick => {
+                if self.media_status_inflight || self.preview_popup.is_none() {
+                    return cosmic::task::none();
+                }
+                let Some(group) = self.active_group.clone() else {
+                    return cosmic::task::none();
+                };
+                let Some(bus_name) = self.media.as_ref().map(|media| media.bus_name.clone()) else {
+                    return cosmic::task::none();
+                };
+
+                self.media_status_inflight = true;
+                let request_bus = bus_name.clone();
+                return Task::perform(media::playback_state(request_bus), move |playing| {
+                    cosmic::Action::App(Message::MediaStatusLoaded(group, bus_name, playing))
+                });
+            }
+'''
+          if old not in s:
+              raise SystemExit('MediaTick marker not found')
+          s = s.replace(old, new, 1)
+          app.write_text(s)
+          PY
+          cargo fmt --all
+      - name: Commit changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/app.rs src/media.rs
+          git commit -m 'Sync visible media playback state while popup is open'
+          git push origin HEAD:v0.3.2-popup-hover-browser-audio
