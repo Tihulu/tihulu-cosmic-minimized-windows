@@ -24,7 +24,7 @@ use cosmic::{
         cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
         wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
     },
-    iced::{self, Subscription, futures, stream},
+    iced::{Subscription, futures, stream},
 };
 use cosmic_protocols::{
     toplevel_info::v1::client::zcosmic_toplevel_handle_v1,
@@ -35,14 +35,14 @@ use sctk::registry::{ProvidesRegistryState, RegistryState};
 
 #[derive(Clone, Debug)]
 pub enum WindowDelta {
-    Present(ToplevelInfo),
+    Present(Box<ToplevelInfo>),
     Gone(ExtForeignToplevelHandleV1),
 }
 
 #[derive(Clone, Debug)]
 pub enum BridgeEvent {
     Ready(calloop::channel::Sender<BridgeCommand>),
-    Window(WindowDelta),
+    Window(Box<WindowDelta>),
     Stopped,
 }
 
@@ -111,11 +111,15 @@ impl BridgeState {
         match (minimized, self.shown.contains(handle)) {
             (true, _) => {
                 self.shown.insert(handle.clone());
-                self.emit(BridgeEvent::Window(WindowDelta::Present(info)));
+                self.emit(BridgeEvent::Window(Box::new(WindowDelta::Present(
+                    Box::new(info),
+                ))));
             }
             (false, true) => {
                 self.shown.remove(handle);
-                self.emit(BridgeEvent::Window(WindowDelta::Gone(handle.clone())));
+                self.emit(BridgeEvent::Window(Box::new(WindowDelta::Gone(
+                    handle.clone(),
+                ))));
             }
             (false, false) => {}
         }
@@ -123,7 +127,9 @@ impl BridgeState {
 
     fn forget(&mut self, handle: &ExtForeignToplevelHandleV1) {
         if self.shown.remove(handle) {
-            self.emit(BridgeEvent::Window(WindowDelta::Gone(handle.clone())));
+            self.emit(BridgeEvent::Window(Box::new(WindowDelta::Gone(
+                handle.clone(),
+            ))));
         }
     }
 }
