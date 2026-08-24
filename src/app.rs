@@ -79,12 +79,24 @@ impl MinimizedWindows {
 
     fn upsert(&mut self, info: ToplevelInfo) {
         let handle = info.foreign_toplevel.clone();
-        if let Some(existing) = self.windows.iter_mut().find(|w| w.handle == handle) {
-            existing.info = info;
+        let (app_label, icon) = self.app_visuals(&info.app_id);
+        let title = info.title.trim();
+        let label = if title.is_empty() || title == app_label {
+            app_label.clone()
+        } else {
+            format!("{title}\n{app_label}")
+        };
+
+        if let Some(index) = self.windows.iter().position(|w| w.handle == handle) {
+            self.windows[index] = Entry {
+                handle,
+                info,
+                label,
+                icon,
+            };
             return;
         }
 
-        let (label, icon) = self.app_visuals(&info.app_id);
         self.windows.push(Entry {
             handle,
             info,
@@ -98,23 +110,10 @@ impl MinimizedWindows {
     }
 
     fn max_inline(&self) -> usize {
-        let Some(bounds) = self.core.applet.suggested_bounds else {
-            return self.windows.len();
-        };
-        let major = match self.core.applet.anchor {
-            PanelAnchor::Top | PanelAnchor::Bottom => bounds.width,
-            PanelAnchor::Left | PanelAnchor::Right => bounds.height,
-        };
-        let icon = self.core.applet.suggested_size(true).0 as f32;
-        let padding = self.core.applet.suggested_padding(true).0 as f32 * 2.0;
-        let slot = (icon + padding + self.core.applet.spacing as f32).max(1.0);
-        let capacity = (major / slot).floor().max(1.0) as usize;
-
-        if self.windows.len() > capacity {
-            capacity.saturating_sub(1).max(1)
-        } else {
-            self.windows.len()
-        }
+        // A minimized-window switcher is only useful when every minimized window is
+        // directly selectable. Let the dock/panel grow with the list instead of hiding
+        // windows behind an overflow button based on suggested bounds.
+        self.windows.len()
     }
 
     fn window_button<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
