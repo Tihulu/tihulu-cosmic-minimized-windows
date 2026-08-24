@@ -31,8 +31,7 @@ pub struct MediaSnapshot {
     pub muted: bool,
     pub can_previous: bool,
     pub can_next: bool,
-    pub can_play: bool,
-    pub can_pause: bool,
+    pub can_play_pause: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -45,11 +44,10 @@ pub struct MediaArtwork {
 #[derive(Clone, Debug)]
 pub enum MediaCommand {
     Previous,
-    Play,
-    Pause,
+    PlayPause,
     Next,
-    VolumeDelta(f64),
-    ToggleMute { restore_volume: f64 },
+    SetVolume(f64),
+    SetMuted { muted: bool, restore_volume: f64 },
 }
 
 #[derive(Debug)]
@@ -108,9 +106,6 @@ async fn snapshot_inner(
             .and_then(|metadata| metadata.title())
             .unwrap_or_default();
 
-        // Browsers can expose an MPRIS player for a tab that is unrelated to the
-        // minimized windows in this group. KDE's task manager applies the same idea:
-        // browser media is only useful when the track/title maps back to the window.
         if looks_like_browser(app_id, app_label, &desktop_entry, &identity, bus_name.as_str())
             && !browser_media_matches(&metadata_title, window_titles)
         {
@@ -168,12 +163,11 @@ async fn snapshot_inner(
     let can_control = player.can_control().await.unwrap_or(false);
     let can_previous = player.can_go_previous().await.unwrap_or(false);
     let can_next = player.can_go_next().await.unwrap_or(false);
-    let can_play = can_control && player.can_play().await.unwrap_or(false);
-    let can_pause = can_control && player.can_pause().await.unwrap_or(false);
+    let can_play_pause = can_control
+        && (player.can_play().await.unwrap_or(false) || player.can_pause().await.unwrap_or(false));
 
-    // Query the actual audio stream only for the short-lived popup snapshot. The stream
-    // IDs are deliberately not stored in MediaSnapshot because Chromium/PipeWire may
-    // recreate them while the popup remains open.
+    // The popup keeps only scalar media state. PipeWire stream IDs are intentionally
+    // not retained because Chromium-family browsers may recreate their sink-input.
     let audio = audio_state(app_id, app_label, &title).await;
     let (volume, muted) = if let Some(audio) = audio {
         (audio.volume, audio.muted)
@@ -194,8 +188,7 @@ async fn snapshot_inner(
         muted,
         can_previous,
         can_next,
-        can_play,
-        can_pause,
+        can_play_pause,
     })
 }
 
@@ -221,18 +214,17 @@ async fn command_inner(
     media_title: String,
     command: MediaCommand,
 ) -> bool {
-    // Audio controls resolve the live PipeWire/PulseAudio stream at click time.
-    // Nothing long-lived is subscribed to or cached.
+    // Re-resolve the live audio stream for every audio command. This avoids stale
+    // Chromium/PipeWire sink-input IDs without adding any watcher or background polling.
     match &command {
-        MediaCommand::VolumeDelta(delta) => {
-            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await {
-                let target = (audio.volume + delta).clamp(0.0, 1.5);
-                if set_audio_volume(&audio.stream_ids, target).await {
-                    return true;
-                }
+        MediaCommand::SetVolume(target) => {
+            if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await
+                && set_audio_volume(&audio.stream_ids, *target).await
+            {
+                return true;
             }
         }
-        MediaCommand::ToggleMute { .. } => {
+        MediaCommand::SetMuted { .. } => {
             if let Some(audio) = audio_state(&app_id, &app_label, &media_title).await
                 && set_audio_muted(&audio.stream_ids, !audio.muted).await
             {
@@ -257,19 +249,21 @@ async fn command_inner(
 
     match command {
         MediaCommand::Previous => player.previous().await.is_ok(),
-        // Explicit Play/Pause calls are idempotent. A stale UI state can no longer
-        // invert the requested action as it could with PlayPause().
-        MediaCommand::Play => player.play().await.is_ok(),
-        MediaCommand::Pause => player.pause().await.is_ok(),
-        MediaCommand::Next => player.next().await.is_ok(),
-        MediaCommand::VolumeDelta(delta) => {
-            let current = player.volume().await.unwrap_or(1.0);
-            player
-                .set_volume((current + delta).clamp(0.0, 1.5))
-                .await
-                .is_ok()
+        MediaCommand::PlayPause => {
+            // Never trust the cached UI boolean for the actual action. Query the player
+            // at click time, then issue the idempotent Play or Pause method explicitly.
+            match player.playback_status().await {
+                Ok(PlaybackStatus::Playing) => player.pause().await.is_ok(),
+                Ok(PlaybackStatus::Paused | PlaybackStatus::Stopped) => player.play().await.is_ok(),
+                Err(_) => false,
+            }
         }
-        MediaCommand::ToggleMute { restore_volume } => {
+        MediaCommand::Next => player.next().await.is_ok(),
+        MediaCommand::SetVolume(volume) => player.set_volume(volume.clamp(0.0, 1.5)).await.is_ok(),
+        MediaCommand::SetMuted {
+            muted: _,
+            restore_volume,
+        } => {
             let current = player.volume().await.unwrap_or(1.0);
             let target = if current <= 0.01 {
                 restore_volume.clamp(0.05, 1.5)
