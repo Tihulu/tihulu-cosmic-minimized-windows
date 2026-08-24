@@ -206,9 +206,7 @@ async fn command_inner(
         false
     } else {
         match &command {
-            MediaCommand::SetVolume(volume) => {
-                set_audio_volume(&audio_stream_ids, *volume).await
-            }
+            MediaCommand::SetVolume(volume) => set_audio_volume(&audio_stream_ids, *volume).await,
             MediaCommand::SetMuted { muted, .. } => {
                 set_audio_muted(&audio_stream_ids, *muted).await
             }
