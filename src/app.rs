@@ -68,10 +68,12 @@ impl MinimizedWindows {
 
     fn app_visuals(&mut self, app_id: &str) -> (String, fde::IconSource) {
         let key = fde::unicase::Ascii::new(app_id);
-        let found = fde::find_app_by_id(&self.desktop_entries, key).cloned().or_else(|| {
-            self.reload_desktop_entries();
-            fde::find_app_by_id(&self.desktop_entries, key).cloned()
-        });
+        let found = fde::find_app_by_id(&self.desktop_entries, key)
+            .cloned()
+            .or_else(|| {
+                self.reload_desktop_entries();
+                fde::find_app_by_id(&self.desktop_entries, key).cloned()
+            });
 
         if let Some(entry) = found {
             let label = entry
@@ -244,10 +246,8 @@ impl cosmic::Application for MinimizedWindows {
             Message::Bridge(BridgeEvent::Window(WindowDelta::Gone(handle))) => {
                 self.remove(&handle);
                 if self.windows.is_empty() {
-                    let hide = cosmic::iced::window::minimize(
-                        self.core.main_window_id().unwrap(),
-                        true,
-                    );
+                    let hide =
+                        cosmic::iced::window::minimize(self.core.main_window_id().unwrap(), true);
                     if let Some(id) = self.overflow.take() {
                         use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
                         return cosmic::app::Task::batch([destroy_popup(id), hide]);
