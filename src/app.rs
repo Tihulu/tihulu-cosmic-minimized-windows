@@ -30,11 +30,13 @@ const HOVER_DELAY: Duration = Duration::from_millis(350);
 const LEAVE_GRACE: Duration = Duration::from_millis(500);
 const SINGLE_PREVIEW_WIDTH: f32 = 320.0;
 const SINGLE_PREVIEW_HEIGHT: f32 = 180.0;
-const GROUP_PREVIEW_WIDTH: f32 = 260.0;
-const GROUP_PREVIEW_HEIGHT: f32 = 146.0;
+// COSMIC constrains panel popups to roughly 360 px on the user's current layout.
+// Two 260 px cards were therefore present but the second one was clipped off-screen.
+const GROUP_PREVIEW_WIDTH: f32 = 150.0;
+const GROUP_PREVIEW_HEIGHT: f32 = 84.0;
 const GROUP_COLUMNS: usize = 2;
-const GROUP_GRID_GAP: f32 = 12.0;
-const GROUP_MAX_VIEWPORT_HEIGHT: f32 = 520.0;
+const GROUP_GRID_GAP: f32 = 10.0;
+const GROUP_MAX_VIEWPORT_HEIGHT: f32 = 430.0;
 const MAX_PREVIEW_IMAGES: usize = 8;
 
 static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> =
@@ -241,8 +243,6 @@ impl MinimizedWindows {
         .padding([py as f32, px as f32])
         .on_press_down(Message::GroupPrimary(group.clone()));
 
-        // Tooltips create a second hover surface and can generate enter/leave churn
-        // while the delayed preview is being armed. Keep one pointer surface per icon.
         cosmic::widget::mouse_area(button)
             .on_enter(Message::GroupHoverEnter(group.clone()))
             .on_exit(Message::GroupHoverExit(group.clone()))
@@ -432,17 +432,10 @@ impl MinimizedWindows {
         self.request_next_preview();
     }
 
-    fn refresh_open_group(&mut self, group: &str) -> Task<Message> {
-        self.start_preview_sequence(group);
-        self.load_media_task(group)
-    }
-
     fn open_group(&mut self, group: String, pinned: bool) -> Task<Message> {
-        if self.active_group.as_deref() == Some(group.as_str()) && self.preview_popup.is_some() {
-            self.popup_pinned |= pinned;
-            return self.refresh_open_group(&group);
-        }
-
+        // Always rebuild the popup surface for a valid hover/click. Reusing an existing
+        // popup ID can leave the applet thinking a compositor-closed surface is still alive,
+        // which is the intermittent "hover does nothing" state seen in real sessions.
         self.reset_popup_payload();
         self.active_group = Some(group.clone());
         self.popup_pinned = pinned;
@@ -483,8 +476,8 @@ impl MinimizedWindows {
             let icon = entry.icon.as_cosmic_icon();
             cosmic::widget::container(
                 cosmic::widget::icon(icon)
-                    .width(Length::Fixed(72.0))
-                    .height(Length::Fixed(72.0)),
+                    .width(Length::Fixed(56.0))
+                    .height(Length::Fixed(56.0)),
             )
             .center_x(Length::Fixed(width))
             .center_y(Length::Fixed(height))
@@ -705,7 +698,7 @@ impl MinimizedWindows {
 
         let grid_view: cosmic::Element<_> = if rows > 2 {
             cosmic::widget::scrollable::vertical(grid)
-                .width(Length::Fixed(grid_width + 16.0))
+                .width(Length::Fixed(grid_width + 12.0))
                 .height(Length::Fixed(viewport_height))
                 .into()
         } else {
@@ -867,17 +860,8 @@ impl cosmic::Application for MinimizedWindows {
                 let epoch = self.hover_epoch;
                 self.hover_group = Some(group.clone());
 
-                if self.active_group.as_deref() == Some(group.as_str())
-                    && self.preview_popup.is_some()
-                {
-                    if !self.popup_pinned {
-                        return self.refresh_open_group(&group);
-                    }
-                    return cosmic::task::none();
-                }
-
-                // Pinned popups no longer globally disable hover. Keep the old popup
-                // visible during the delay and replace it only if this hover is still active.
+                // Every fresh hover is armed independently. This avoids a stale popup ID or
+                // pinned/previous state suppressing later hover attempts.
                 return Self::hover_delay_task(group, epoch);
             }
             Message::GroupHoverExit(group) => {
@@ -895,7 +879,9 @@ impl cosmic::Application for MinimizedWindows {
             Message::HoverDelayElapsed(group, epoch) => {
                 if self.hover_epoch == epoch && self.hover_group.as_deref() == Some(group.as_str())
                 {
-                    return self.open_group(group, false);
+                    let keep_pinned = self.popup_pinned
+                        && self.active_group.as_deref() == Some(group.as_str());
+                    return self.open_group(group, keep_pinned);
                 }
             }
             Message::PopupEnter => {
@@ -987,8 +973,14 @@ impl cosmic::Application for MinimizedWindows {
                 let Some(group) = self.active_group.clone() else {
                     return cosmic::task::none();
                 };
+                let Some(entry) = self.group_entry(&group) else {
+                    return cosmic::task::none();
+                };
+
                 let bus_name = media.bus_name.clone();
-                let audio_stream_ids = media.audio_stream_ids.clone();
+                let media_title = media.title.clone();
+                let app_id = entry.app_id.clone();
+                let app_label = entry.app_label.clone();
                 let command = match action {
                     MediaUiAction::Previous => MediaCommand::Previous,
                     MediaUiAction::PlayPause => MediaCommand::PlayPause,
@@ -1011,7 +1003,7 @@ impl cosmic::Application for MinimizedWindows {
                 };
 
                 return Task::perform(
-                    media::command(bus_name, audio_stream_ids, command),
+                    media::command(bus_name, app_id, app_label, media_title, command),
                     move |_| cosmic::Action::App(Message::RefreshMedia(group)),
                 );
             }
