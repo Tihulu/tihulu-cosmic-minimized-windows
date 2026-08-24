@@ -428,10 +428,10 @@ impl BridgeState {
     }
 
     fn cancel_token(&mut self, token: u64) {
-        if self.capture_running.as_ref().map(|job| job.token) == Some(token) {
-            if let Some(cancel) = &self.capture_cancel {
-                cancel.store(true, Ordering::Release);
-            }
+        if self.capture_running.as_ref().map(|job| job.token) == Some(token)
+            && let Some(cancel) = &self.capture_cancel
+        {
+            cancel.store(true, Ordering::Release);
         }
         if self.capture_pending.as_ref().map(|job| job.token) == Some(token) {
             self.capture_pending = None;
@@ -443,10 +443,9 @@ impl BridgeState {
             .capture_running
             .as_ref()
             .is_some_and(|job| &job.handle == handle)
+            && let Some(cancel) = &self.capture_cancel
         {
-            if let Some(cancel) = &self.capture_cancel {
-                cancel.store(true, Ordering::Release);
-            }
+            cancel.store(true, Ordering::Release);
         }
         if self
             .capture_pending
@@ -473,10 +472,10 @@ impl BridgeState {
             });
         }
 
-        if self.capture_running.is_none() {
-            if let Some(next) = self.capture_pending.take() {
-                self.start_capture(next);
-            }
+        if self.capture_running.is_none()
+            && let Some(next) = self.capture_pending.take()
+        {
+            self.start_capture(next);
         }
     }
 }
