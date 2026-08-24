@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use cctk::wayland_client::{Connection, QueueHandle, globals::registry_queue_init};
 use cctk::{
     sctk::{
         self,
@@ -31,7 +32,6 @@ use cosmic_protocols::{
 };
 use futures::{SinkExt, channel::mpsc};
 use sctk::registry::{ProvidesRegistryState, RegistryState};
-use cctk::wayland_client::{Connection, QueueHandle, globals::registry_queue_init};
 
 #[derive(Clone, Debug)]
 pub enum WindowDelta {
@@ -208,10 +208,7 @@ impl ToplevelManagerHandler for BridgeState {
     }
 }
 
-fn bridge_loop(
-    out: mpsc::Sender<BridgeEvent>,
-    commands: calloop::channel::Channel<BridgeCommand>,
-) {
+fn bridge_loop(out: mpsc::Sender<BridgeEvent>, commands: calloop::channel::Channel<BridgeCommand>) {
     let privileged = std::env::var("X_PRIVILEGED_WAYLAND_SOCKET")
         .ok()
         .and_then(|value| value.parse::<RawFd>().ok())
