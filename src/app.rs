@@ -379,9 +379,12 @@ impl MinimizedWindows {
         let titles = self.group_titles(group);
         let group = group.to_owned();
 
-        Task::perform(media::snapshot(app_id, app_label, titles), move |snapshot| {
-            cosmic::Action::App(Message::MediaLoaded(group, snapshot.map(Box::new)))
-        })
+        Task::perform(
+            media::snapshot(app_id, app_label, titles),
+            move |snapshot| {
+                cosmic::Action::App(Message::MediaLoaded(group, snapshot.map(Box::new)))
+            },
+        )
     }
 
     fn load_art_task(group: String, url: String) -> Task<Message> {
@@ -681,12 +684,12 @@ impl MinimizedWindows {
         }
 
         let (preview_width, preview_height, columns) = Self::preview_dimensions(entries.len());
-        let grid_width = preview_width * columns as f32
-            + GROUP_GRID_GAP * columns.saturating_sub(1) as f32;
+        let grid_width =
+            preview_width * columns as f32 + GROUP_GRID_GAP * columns.saturating_sub(1) as f32;
         let rows = entries.len().div_ceil(columns);
         let estimated_card_height = preview_height + 42.0;
-        let estimated_grid_height = estimated_card_height * rows as f32
-            + GROUP_GRID_GAP * rows.saturating_sub(1) as f32;
+        let estimated_grid_height =
+            estimated_card_height * rows as f32 + GROUP_GRID_GAP * rows.saturating_sub(1) as f32;
         let viewport_height = estimated_grid_height
             .min(GROUP_MAX_VIEWPORT_HEIGHT)
             .max(1.0);
@@ -892,8 +895,7 @@ impl cosmic::Application for MinimizedWindows {
                 }
             }
             Message::HoverDelayElapsed(group, epoch) => {
-                if self.hover_epoch == epoch
-                    && self.hover_group.as_deref() == Some(group.as_str())
+                if self.hover_epoch == epoch && self.hover_group.as_deref() == Some(group.as_str())
                 {
                     return self.open_group(group, false);
                 }
