@@ -202,18 +202,21 @@ async fn command_inner(
     audio_stream_ids: Vec<u32>,
     command: MediaCommand,
 ) -> bool {
-    match &command {
-        MediaCommand::SetVolume(volume) if !audio_stream_ids.is_empty() => {
-            if set_audio_volume(&audio_stream_ids, *volume).await {
-                return true;
+    let audio_handled = if audio_stream_ids.is_empty() {
+        false
+    } else {
+        match &command {
+            MediaCommand::SetVolume(volume) => {
+                set_audio_volume(&audio_stream_ids, *volume).await
             }
-        }
-        MediaCommand::SetMuted { muted, .. } if !audio_stream_ids.is_empty() => {
-            if set_audio_muted(&audio_stream_ids, *muted).await {
-                return true;
+            MediaCommand::SetMuted { muted, .. } => {
+                set_audio_muted(&audio_stream_ids, *muted).await
             }
+            _ => false,
         }
-        _ => {}
+    };
+    if audio_handled {
+        return true;
     }
 
     let connection = match zbus::Connection::session().await {
