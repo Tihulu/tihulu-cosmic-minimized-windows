@@ -363,16 +363,15 @@ impl cosmic::Application for MinimizedWindows {
                     return cosmic::task::none();
                 }
 
-                if let Some(tx) = &self.command_tx {
-                    if tx
+                if let Some(tx) = &self.command_tx
+                    && tx
                         .send(BridgeCommand::CapturePreview {
                             token,
                             handle: handle.clone(),
                         })
                         .is_ok()
-                    {
-                        self.active_capture_token = Some(token);
-                    }
+                {
+                    self.active_capture_token = Some(token);
                 }
                 return self.open_preview_popup();
             }
