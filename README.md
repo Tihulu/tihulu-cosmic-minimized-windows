@@ -4,6 +4,8 @@ A stability-focused minimized-window applet for the COSMIC desktop, licensed **A
 
 It provides grouped minimized-window management, on-demand hover previews, per-window restore/close controls, and optional MPRIS media controls while deliberately bounding screenshot, memory, D-Bus, and artwork activity.
 
+> **v0.3.2 validation note:** the `v0.3.2-popup-hover-browser-audio` branch is a runtime-test candidate, not the stable release. It should be promoted only after CI is green and real COSMIC testing confirms grouped previews, repeated hover, browser media controls, and FD/resource behavior.
+
 ## Why this exists
 
 A system that motivated this project hit `Too many open files` in the COSMIC session, followed by Wayland/EGL failures and panel restart backoff. COSMIC has also had reports around minimized-window screenshot/resource growth during window churn.
@@ -56,8 +58,10 @@ Resource lifetime is intentionally conservative because avoiding panel/session e
 ### Media preview
 
 - no always-running MPRIS watcher
-- MPRIS is queried only while a relevant popup is open or immediately after a media-control action
-- playback progress uses a local **1 Hz UI tick** while playing; that tick does not take screenshots or issue repeated D-Bus queries
+- full MPRIS metadata is queried only when a relevant popup opens or immediately after a media-control action
+- while a media popup is visible, a bounded 1 Hz check reads only `PlaybackStatus` so the play/pause icon follows external player changes; it does not capture screenshots, query PipeWire, reload artwork, or refresh full metadata
+- audio commands resolve the live PipeWire/PulseAudio stream at click time rather than retaining Chromium sink-input IDs
+- volume adjustments are applied relative to the live stream volume at click time
 - only one album-art image is retained for the currently open popup
 - remote/local album art is capped at **2 MiB** before decode and resized to at most **144 px**
 - album-art network/file operations have timeouts
