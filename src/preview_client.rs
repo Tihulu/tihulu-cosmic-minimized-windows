@@ -5,6 +5,7 @@ use std::{path::Path, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    sync::Semaphore,
 };
 
 use crate::preview_ipc::{
@@ -13,6 +14,7 @@ use crate::preview_ipc::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
+static CAPTURE_GATE: Semaphore = Semaphore::const_new(1);
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreviewPayload {
@@ -24,6 +26,10 @@ pub(crate) struct PreviewPayload {
 }
 
 pub(crate) async fn capture(key: String, identifier: String) -> Result<PreviewPayload, String> {
+    let _permit = CAPTURE_GATE
+        .acquire()
+        .await
+        .map_err(|_| "preview capture gate closed".to_owned())?;
     let response = request(Request::Capture {
         version: PROTOCOL_VERSION,
         key,
