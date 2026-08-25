@@ -35,6 +35,8 @@ use cctk::wayland_protocols::ext::{
 };
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 
+const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug)]
 struct ToplevelInfo {
     handle: ExtForeignToplevelHandleV1,
@@ -245,7 +247,7 @@ impl CaptureWayland {
         let _ = self.queue.roundtrip(&mut self.state);
 
         let raw = raw_result?;
-        let rgba = Self::to_rgba(&raw, layout);
+        let rgba = Self::to_rgba(raw, layout);
         Ok(CapturedFrame {
             width,
             height,
@@ -314,25 +316,33 @@ impl CaptureWayland {
             .checked_mul(height)
             .ok_or_else(|| format!("buffer size overflow for {width}x{height}"))?;
         let size = usize::try_from(size_u32).map_err(|_| "buffer does not fit usize".to_owned())?;
+        if size > MAX_CAPTURE_BYTES {
+            return Err(format!(
+                "capture buffer exceeds {} MiB safety budget: {width}x{height} requires {} bytes",
+                MAX_CAPTURE_BYTES / (1024 * 1024),
+                size
+            ));
+        }
         let size_i32 =
             i32::try_from(size).map_err(|_| format!("buffer too large: {size} bytes"))?;
         Ok((width, height, stride, size, size_i32, format, layout))
     }
 
-    fn to_rgba(raw: &[u8], layout: PixelLayout) -> Vec<u8> {
-        let mut rgba = Vec::with_capacity(raw.len());
-        let (pixels, remainder) = raw.as_chunks::<4>();
+    fn to_rgba(mut raw: Vec<u8>, layout: PixelLayout) -> Vec<u8> {
+        let (pixels, remainder) = raw.as_chunks_mut::<4>();
         debug_assert!(remainder.is_empty());
         for pixel in pixels {
-            let (r, g, b, a) = match layout {
-                PixelLayout::Xrgb => (pixel[2], pixel[1], pixel[0], 255),
-                PixelLayout::Argb => (pixel[2], pixel[1], pixel[0], pixel[3]),
-                PixelLayout::Xbgr => (pixel[0], pixel[1], pixel[2], 255),
-                PixelLayout::Abgr => (pixel[0], pixel[1], pixel[2], pixel[3]),
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
+            match layout {
+                PixelLayout::Xrgb => {
+                    pixel.swap(0, 2);
+                    pixel[3] = 255;
+                }
+                PixelLayout::Argb => pixel.swap(0, 2),
+                PixelLayout::Xbgr => pixel[3] = 255,
+                PixelLayout::Abgr => {}
+            }
         }
-        rgba
+        raw
     }
 }
 
@@ -518,17 +528,29 @@ ignore_events!(
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureWayland, PixelLayout};
+    use super::{CaptureState, CaptureWayland, MAX_CAPTURE_BYTES, PixelLayout, wl_shm};
 
     #[test]
-    fn xrgb_is_converted_to_rgba() {
-        let rgba = CaptureWayland::to_rgba(&[1, 2, 3, 0], PixelLayout::Xrgb);
+    fn xrgb_is_converted_to_rgba_in_place() {
+        let rgba = CaptureWayland::to_rgba(vec![1, 2, 3, 0], PixelLayout::Xrgb);
         assert_eq!(rgba, [3, 2, 1, 255]);
     }
 
     #[test]
-    fn xbgr_is_converted_to_rgba() {
-        let rgba = CaptureWayland::to_rgba(&[3, 2, 1, 0], PixelLayout::Xbgr);
+    fn xbgr_is_converted_to_rgba_in_place() {
+        let rgba = CaptureWayland::to_rgba(vec![3, 2, 1, 0], PixelLayout::Xbgr);
         assert_eq!(rgba, [3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn oversized_capture_is_rejected_before_allocation() {
+        let state = CaptureState {
+            size: Some((8192, 8192)),
+            formats: vec![u32::from(wl_shm::Format::Xrgb8888)],
+            ..CaptureState::default()
+        };
+        let error = CaptureWayland::capture_layout(&state).unwrap_err();
+        assert!(error.contains("safety budget"));
+        assert!(8192_usize * 8192 * 4 > MAX_CAPTURE_BYTES);
     }
 }
