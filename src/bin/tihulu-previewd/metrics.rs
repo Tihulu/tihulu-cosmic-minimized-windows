@@ -9,7 +9,6 @@ const GROWTH_THRESHOLD: usize = 4;
 pub(crate) struct ProcessMetrics {
     pub(crate) fd_count: usize,
     pub(crate) rss_kb: u64,
-    pub(crate) shmem_kb: u64,
     pub(crate) memfd_count: usize,
     pub(crate) capture_memfd_count: usize,
 }
@@ -36,7 +35,6 @@ pub(crate) fn process_metrics(pid: u32) -> ProcessMetrics {
 
     if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
         metrics.rss_kb = status_value_kb(&status, "VmRSS:").unwrap_or(0);
-        metrics.shmem_kb = status_value_kb(&status, "RssShmem:").unwrap_or(0);
     }
     metrics
 }
@@ -78,7 +76,9 @@ fn status_uid(status: &str) -> Option<u32> {
 #[derive(Default)]
 pub(crate) struct GrowthWatch {
     daemon_fd: VecDeque<usize>,
+    daemon_memfd: VecDeque<usize>,
     comp_fd: VecDeque<usize>,
+    comp_memfd: VecDeque<usize>,
     comp_capture_memfd: VecDeque<usize>,
 }
 
@@ -89,15 +89,26 @@ impl GrowthWatch {
         compositor: Option<ProcessMetrics>,
     ) -> Option<&'static str> {
         push_window(&mut self.daemon_fd, daemon.fd_count);
+        push_window(&mut self.daemon_memfd, daemon.memfd_count);
         if monotonic_growth(&self.daemon_fd) {
             return Some("previewd FD count is growing monotonically");
+        }
+        if monotonic_growth(&self.daemon_memfd) {
+            return Some("previewd memfd count is growing monotonically");
         }
 
         if let Some(compositor) = compositor {
             push_window(&mut self.comp_fd, compositor.fd_count);
-            push_window(&mut self.comp_capture_memfd, compositor.capture_memfd_count);
+            push_window(&mut self.comp_memfd, compositor.memfd_count);
+            push_window(
+                &mut self.comp_capture_memfd,
+                compositor.capture_memfd_count,
+            );
             if monotonic_growth(&self.comp_capture_memfd) {
                 return Some("cosmic-comp capture-related memfds are growing monotonically");
+            }
+            if monotonic_growth(&self.comp_memfd) {
+                return Some("cosmic-comp total memfds are growing monotonically");
             }
             if monotonic_growth(&self.comp_fd) {
                 return Some("cosmic-comp FD count is growing monotonically");
@@ -136,11 +147,15 @@ mod tests {
 
     #[test]
     fn bounded_fd_oscillation_is_safe() {
-        assert!(!monotonic_growth(&VecDeque::from([370, 373, 369, 373, 366, 374])));
+        assert!(!monotonic_growth(&VecDeque::from([
+            370, 373, 369, 373, 366, 374
+        ])));
     }
 
     #[test]
     fn monotonic_fd_growth_trips() {
-        assert!(monotonic_growth(&VecDeque::from([90, 91, 92, 93, 94, 95])));
+        assert!(monotonic_growth(&VecDeque::from([
+            90, 91, 92, 93, 94, 95
+        ])));
     }
 }
