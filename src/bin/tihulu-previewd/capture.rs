@@ -70,6 +70,8 @@ enum PixelLayout {
     Abgr,
 }
 
+type CaptureLayout = (u32, u32, u32, usize, i32, wl_shm::Format, PixelLayout);
+
 pub(crate) struct CapturedFrame {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -271,9 +273,7 @@ impl CaptureWayland {
         done(&self.state.capture)
     }
 
-    fn capture_layout(
-        capture: &CaptureState,
-    ) -> Result<(u32, u32, u32, usize, i32, wl_shm::Format, PixelLayout), String> {
+    fn capture_layout(capture: &CaptureState) -> Result<CaptureLayout, String> {
         let (width, height) = capture
             .size
             .ok_or_else(|| "session did not advertise buffer size".to_owned())?;
@@ -321,7 +321,9 @@ impl CaptureWayland {
 
     fn to_rgba(raw: &[u8], layout: PixelLayout) -> Vec<u8> {
         let mut rgba = Vec::with_capacity(raw.len());
-        for pixel in raw.chunks_exact(4) {
+        let (pixels, remainder) = raw.as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for pixel in pixels {
             let (r, g, b, a) = match layout {
                 PixelLayout::Xrgb => (pixel[2], pixel[1], pixel[0], 255),
                 PixelLayout::Argb => (pixel[2], pixel[1], pixel[0], pixel[3]),
