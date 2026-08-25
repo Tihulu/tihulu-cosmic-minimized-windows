@@ -64,6 +64,14 @@ impl PopupFsm {
     }
 
     pub(crate) fn group_enter(&mut self, group: String) {
+        if self.active_group().is_some_and(|active| active != group) {
+            // Do not cancel the previous group's pending close merely because the
+            // pointer crossed directly onto another app icon. Live cross-group
+            // replacement used to destroy/create popup surfaces in one event-loop
+            // turn and proved unstable on real COSMIC sessions.
+            self.pointer_group = None;
+            return;
+        }
         self.pointer_group = Some(group);
         self.invalidate_close();
     }
@@ -89,11 +97,11 @@ impl PopupFsm {
         pinned: bool,
         new_window_id: WindowId,
     ) -> OpenPlan {
-        self.invalidate_close();
         let previous = std::mem::take(&mut self.state);
 
         match previous {
             PopupState::Closed => {
+                self.invalidate_close();
                 let session = self.new_session(group.clone(), new_window_id);
                 self.state = if pinned {
                     PopupState::Pinned(session)
@@ -107,6 +115,7 @@ impl PopupFsm {
             }
             PopupState::HoverOpen(session) => {
                 if session.group == group {
+                    self.invalidate_close();
                     self.state = if pinned {
                         PopupState::Pinned(session)
                     } else {
@@ -114,34 +123,23 @@ impl PopupFsm {
                     };
                     OpenPlan::None
                 } else {
-                    let old_window_id = session.window_id;
-                    let session = self.new_session(group.clone(), new_window_id);
-                    self.state = if pinned {
-                        PopupState::Pinned(session)
-                    } else {
-                        PopupState::HoverOpen(session)
-                    };
-                    OpenPlan::Replace {
-                        old_window_id,
-                        window_id: new_window_id,
-                        group,
-                    }
+                    // Stability-first rule: never live-replace one hover popup with
+                    // another. Let the current popup finish its normal close path,
+                    // then the new group may open on a fresh enter/click.
+                    self.state = PopupState::HoverOpen(session);
+                    OpenPlan::None
                 }
             }
             PopupState::Pinned(session) => {
-                if !pinned || session.group == group {
-                    self.state = PopupState::Pinned(session);
-                    OpenPlan::None
-                } else {
-                    let old_window_id = session.window_id;
-                    let session = self.new_session(group.clone(), new_window_id);
-                    self.state = PopupState::Pinned(session);
-                    OpenPlan::Replace {
-                        old_window_id,
-                        window_id: new_window_id,
-                        group,
-                    }
+                if session.group == group {
+                    self.invalidate_close();
                 }
+                // A pinned surface is never replaced from another group while it is
+                // alive. This deliberately leaves OpenPlan::Replace unreachable in
+                // the runtime path until we implement compositor-acknowledged
+                // two-phase replacement.
+                self.state = PopupState::Pinned(session);
+                OpenPlan::None
             }
         }
     }
@@ -183,6 +181,7 @@ impl PopupFsm {
             return false;
         }
         self.state = PopupState::Closed;
+        self.pointer_group = None;
         self.pointer_in_popup = false;
         self.invalidate_close();
         true
@@ -249,62 +248,57 @@ mod tests {
     }
 
     #[test]
-    fn switching_hover_group_replaces_and_reanchors_surface() {
+    fn cross_group_hover_never_live_replaces_surface() {
         let mut fsm = PopupFsm::default();
         let old = WindowId::unique();
-        let new = WindowId::unique();
         fsm.request_open("brave".into(), false, old);
-        let old_generation = fsm.session().unwrap().generation;
-        let plan = fsm.request_open("firefox".into(), false, new);
-        assert_eq!(
-            plan,
-            OpenPlan::Replace {
-                old_window_id: old,
-                window_id: new,
-                group: "firefox".into()
-            }
-        );
-        assert_eq!(fsm.active_group(), Some("firefox"));
-        assert!(fsm.session().unwrap().generation > old_generation);
+        let generation = fsm.session().unwrap().generation;
+        let plan = fsm.request_open("spotify".into(), false, WindowId::unique());
+        assert_eq!(plan, OpenPlan::None);
+        assert_eq!(fsm.window_id(), Some(old));
+        assert_eq!(fsm.active_group(), Some("brave"));
+        assert_eq!(fsm.session().unwrap().generation, generation);
     }
 
     #[test]
-    fn stale_close_guard_cannot_close_after_reenter() {
+    fn crossing_to_another_icon_does_not_cancel_old_close_guard() {
+        let mut fsm = PopupFsm::default();
+        fsm.group_enter("brave".into());
+        fsm.request_open("brave".into(), false, WindowId::unique());
+        fsm.group_exit("brave");
+        let guard = fsm.schedule_close().unwrap();
+        fsm.group_enter("spotify".into());
+        assert!(fsm.should_close(guard));
+    }
+
+    #[test]
+    fn stale_close_guard_cannot_close_after_reenter_same_group() {
         let mut fsm = PopupFsm::default();
         fsm.request_open("brave".into(), false, WindowId::unique());
         fsm.group_exit("brave");
         let guard = fsm.schedule_close().unwrap();
-        fsm.popup_enter();
-        assert!(!fsm.should_close(guard));
-    }
-
-    #[test]
-    fn stale_close_guard_cannot_close_new_generation() {
-        let mut fsm = PopupFsm::default();
-        fsm.request_open("brave".into(), false, WindowId::unique());
-        let guard = fsm.schedule_close().unwrap();
-        fsm.request_open("firefox".into(), false, WindowId::unique());
+        fsm.group_enter("brave".into());
         assert!(!fsm.should_close(guard));
     }
 
     #[test]
     fn stale_compositor_close_is_ignored() {
         let mut fsm = PopupFsm::default();
-        let old = WindowId::unique();
-        let new = WindowId::unique();
-        fsm.request_open("brave".into(), false, old);
-        fsm.request_open("firefox".into(), false, new);
-        assert!(!fsm.compositor_closed(old));
-        assert_eq!(fsm.window_id(), Some(new));
+        let current = WindowId::unique();
+        fsm.request_open("brave".into(), false, current);
+        assert!(!fsm.compositor_closed(WindowId::unique()));
+        assert_eq!(fsm.window_id(), Some(current));
     }
 
     #[test]
-    fn current_compositor_close_clears_surface() {
+    fn current_compositor_close_clears_surface_and_pointer_state() {
         let mut fsm = PopupFsm::default();
         let id = WindowId::unique();
+        fsm.group_enter("brave".into());
         fsm.request_open("brave".into(), false, id);
         assert!(fsm.compositor_closed(id));
         assert!(!fsm.is_open());
+        assert_eq!(fsm.pointer_group, None);
     }
 
     #[test]
