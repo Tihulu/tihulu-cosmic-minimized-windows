@@ -64,6 +64,10 @@ impl PopupFsm {
     }
 
     pub(crate) fn group_enter(&mut self, group: String) {
+        // The panel icon and popup are separate Wayland surfaces. Entering one
+        // means the pointer cannot still be inside the other. Clearing the
+        // opposite flag also repairs a missed cross-surface on_exit event.
+        self.pointer_in_popup = false;
         self.pointer_group = Some(group);
         self.invalidate_close();
     }
@@ -75,6 +79,9 @@ impl PopupFsm {
     }
 
     pub(crate) fn popup_enter(&mut self) {
+        // A popup enter is authoritative: if the panel icon's exit event was
+        // lost while crossing surfaces, do not keep a stale group hover alive.
+        self.pointer_group = None;
         self.pointer_in_popup = true;
         self.invalidate_close();
     }
@@ -183,6 +190,7 @@ impl PopupFsm {
             return false;
         }
         self.state = PopupState::Closed;
+        self.pointer_group = None;
         self.pointer_in_popup = false;
         self.invalidate_close();
         true
@@ -269,6 +277,40 @@ mod tests {
     }
 
     #[test]
+    fn popup_enter_repairs_missing_group_exit() {
+        let mut fsm = PopupFsm::default();
+        fsm.group_enter("brave".into());
+        fsm.request_open("brave".into(), false, WindowId::unique());
+
+        // Simulate crossing directly from the icon into the popup without the
+        // panel surface delivering GroupHoverExit.
+        fsm.popup_enter();
+        assert_eq!(fsm.pointer_group, None);
+        assert!(fsm.pointer_in_popup);
+
+        fsm.popup_exit();
+        let guard = fsm.schedule_close().unwrap();
+        assert!(fsm.should_close(guard));
+    }
+
+    #[test]
+    fn group_enter_repairs_missing_popup_exit() {
+        let mut fsm = PopupFsm::default();
+        fsm.request_open("brave".into(), false, WindowId::unique());
+        fsm.popup_enter();
+
+        // Simulate crossing back to the icon without the popup surface
+        // delivering PopupExit.
+        fsm.group_enter("brave".into());
+        assert!(!fsm.pointer_in_popup);
+        assert_eq!(fsm.pointer_group.as_deref(), Some("brave"));
+
+        fsm.group_exit("brave");
+        let guard = fsm.schedule_close().unwrap();
+        assert!(fsm.should_close(guard));
+    }
+
+    #[test]
     fn stale_close_guard_cannot_close_after_reenter() {
         let mut fsm = PopupFsm::default();
         fsm.request_open("brave".into(), false, WindowId::unique());
@@ -303,8 +345,12 @@ mod tests {
         let mut fsm = PopupFsm::default();
         let id = WindowId::unique();
         fsm.request_open("brave".into(), false, id);
+        fsm.group_enter("brave".into());
+        fsm.popup_enter();
         assert!(fsm.compositor_closed(id));
         assert!(!fsm.is_open());
+        assert_eq!(fsm.pointer_group, None);
+        assert!(!fsm.pointer_in_popup);
     }
 
     #[test]
