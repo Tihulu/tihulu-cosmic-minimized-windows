@@ -147,9 +147,8 @@ impl ProbeWayland {
         self.state.capture = CaptureState::default();
 
         let session = copy_mgr.create_session(source, Options::empty(), &qh, ());
-        let constraints = self.roundtrip_until(|capture| {
-            capture.constraints_done || capture.failed
-        });
+        let constraints =
+            self.roundtrip_until(|capture| capture.constraints_done || capture.failed);
         if !constraints || self.state.capture.failed {
             let reason = self
                 .state
@@ -351,7 +350,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 _,
             >(
                 name,
-                version.min(ExtForeignToplevelImageCaptureSourceManagerV1::interface().version),
+                version.min(
+                    ExtForeignToplevelImageCaptureSourceManagerV1::interface().version,
+                ),
                 qh,
                 (),
             ));
@@ -466,18 +467,20 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
 }
 
 macro_rules! ignore_events {
-    ($($type:ty),+ $(,)?) => {$(
-        impl Dispatch<$type, ()> for State {
-            fn event(
-                _: &mut Self,
-                _: &$type,
-                _: <$type as Proxy>::Event,
-                _: &(),
-                _: &Connection,
-                _: &QueueHandle<Self>,
-            ) {}
-        }
-    )+};
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl Dispatch<$type, ()> for State {
+                fn event(
+                    _: &mut Self,
+                    _: &$type,
+                    _: <$type as Proxy>::Event,
+                    _: &(),
+                    _: &Connection,
+                    _: &QueueHandle<Self>,
+                ) {}
+            }
+        )+
+    };
 }
 
 ignore_events!(
