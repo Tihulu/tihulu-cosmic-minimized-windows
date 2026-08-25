@@ -17,6 +17,7 @@ fail() {
 command -v git >/dev/null 2>&1 || fail "git is required"
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
 command -v pgrep >/dev/null 2>&1 || fail "pgrep is required"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 
 [[ "${XDG_SESSION_TYPE:-}" == "wayland" || -n "${WAYLAND_DISPLAY:-}" ]] || \
     fail "this must run inside your COSMIC Wayland session"
@@ -62,18 +63,20 @@ set -e
 [[ -s "$CSV" ]] || fail "probe produced no CSV output"
 
 printf '\n==> Resource summary\n'
-python3 - "$CSV" "$PROBE_RC" <<'PY'
+set +e
+python3 - "$CSV" "$PROBE_RC" "$CAPTURES" <<'PY'
 import csv
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 probe_rc = int(sys.argv[2])
+expected_captures = int(sys.argv[3])
 with path.open(newline="") as handle:
     rows = list(csv.DictReader(handle))
 
 if not rows:
-    print("FAIL: CSV has no samples")
+    print("VERDICT: FAIL — CSV has no samples.")
     raise SystemExit(2)
 
 numeric = [
@@ -99,42 +102,63 @@ first = rows[0]
 last = rows[-1]
 for key in numeric:
     values = [value(row, key) for row in rows]
-    print(f"{key:28s} start={values[0]:8d} end={values[-1]:8d} max={max(values):8d} delta={values[-1]-values[0]:+8d}")
+    print(
+        f"{key:28s} start={values[0]:8d} end={values[-1]:8d} "
+        f"max={max(values):8d} delta={values[-1]-values[0]:+8d}"
+    )
 
 capture_rows = [row for row in rows if row.get("phase") == "capture"]
-failed = sum((row.get("capture_ok") or "").strip().lower() not in {"true", "1"} for row in capture_rows)
-print(f"captures sampled/failed       {len(capture_rows)}/{failed}")
+failed_samples = sum(
+    (row.get("capture_ok") or "").strip().lower() not in {"true", "1"}
+    for row in capture_rows
+)
+final_iteration = value(last, "iteration")
+print(f"CSV sample rows               {len(rows)}")
+print(f"failed capture samples        {failed_samples}")
+print(f"final iteration               {final_iteration}/{expected_captures}")
 print(f"probe exit code               {probe_rc}")
 
 # The Rust circuit breaker is authoritative for monotonic FD/capture-memfd growth.
 if probe_rc == 2:
     print("VERDICT: FAIL — circuit breaker tripped; preview integration is NOT approved.")
     raise SystemExit(2)
-if probe_rc != 0:
-    print("VERDICT: FAIL — probe did not complete successfully.")
+if probe_rc != 0 or final_iteration != expected_captures:
+    print("VERDICT: FAIL — probe did not complete all requested captures.")
     raise SystemExit(2)
 
-# Additional conservative end-to-start checks. Small oscillations are allowed.
-fd_keys = ["probe_fd", "cosmic_comp_fd", "cosmic_comp_capture_memfd", "cosmic_comp_memfd"]
+# Additional conservative end-to-start checks. Small bounded oscillations are allowed.
+fd_keys = [
+    "probe_fd",
+    "cosmic_comp_fd",
+    "cosmic_comp_capture_memfd",
+    "cosmic_comp_memfd",
+]
 fd_growth = {key: value(last, key) - value(first, key) for key in fd_keys}
 if any(delta >= 4 for delta in fd_growth.values()):
     print("VERDICT: FAIL — persistent FD/memfd growth remains at the end of the run.")
     raise SystemExit(2)
 
-# RSS is noisy and is intentionally not an automatic hard fail in the Rust breaker.
-comp_rss_start = value(first, "cosmic_comp_rss_kb")
-comp_rss_end = value(last, "cosmic_comp_rss_kb")
-probe_rss_start = value(first, "probe_rss_kb")
-probe_rss_end = value(last, "probe_rss_kb")
-rss_growth = max(comp_rss_end - comp_rss_start, probe_rss_end - probe_rss_start)
-if rss_growth >= 64 * 1024:
-    print("VERDICT: REVIEW — FD/memfd are bounded, but RSS increased by >=64 MiB; inspect the CSV before approval.")
+if failed_samples:
+    print("VERDICT: REVIEW — at least one capture failed; inspect the CSV before approval.")
     raise SystemExit(3)
 
-print("VERDICT: PASS — no circuit-breaker event and no persistent FD/memfd growth detected.")
-print("This is the runtime safety gate for beginning previewd work; the CSV is retained for audit.")
+# RSS is noisy, so it never hard-fails automatically. A meaningful retained increase is REVIEW.
+rss_keys = ["probe_rss_kb", "cosmic_comp_rss_kb"]
+for key in rss_keys:
+    values = [value(row, key) for row in rows]
+    retained = values[-1] - values[0]
+    if retained >= 32 * 1024:
+        print(
+            f"VERDICT: REVIEW — {key} retained >=32 MiB above baseline; "
+            "inspect the CSV trend before approval."
+        )
+        raise SystemExit(3)
+
+print("VERDICT: PASS — 500-capture safety checks show bounded FD/memfd behavior.")
+print("CSV retained for audit. previewd work may begin only from a real minimized-window run.")
 PY
 ANALYZE_RC=$?
+set -e
 
 printf '\nCSV: %s\n' "$CSV"
 exit "$ANALYZE_RC"
