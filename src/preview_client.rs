@@ -74,9 +74,9 @@ pub(crate) async fn health() -> Result<(), String> {
             }
         }
         Response::Error { message, .. } => Err(message),
-        Response::Hello { .. }
-        | Response::Thumbnail { .. }
-        | Response::Missing { .. } => Err("unexpected previewd health response".to_owned()),
+        Response::Hello { .. } | Response::Thumbnail { .. } | Response::Missing { .. } => {
+            Err("unexpected previewd health response".to_owned())
+        }
     }
 }
 
