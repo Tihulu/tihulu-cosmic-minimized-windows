@@ -3,6 +3,8 @@
 mod app;
 mod config;
 mod popup;
+mod preview_client;
+mod preview_ipc;
 mod wayland;
 
 fn main() -> cosmic::iced::Result {
