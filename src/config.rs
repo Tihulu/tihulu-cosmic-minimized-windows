@@ -17,19 +17,26 @@ pub(crate) enum FeatureMode {
 
 impl FeatureMode {
     pub(crate) fn safe_core(self) -> bool {
-        true
+        matches!(self, Self::SafeCore)
     }
 
-    fn parse(_contents: &str) -> Self {
-        // v0.4 is a runtime-validation release candidate. Extended mode stays
-        // locked until the external preview/media daemons pass their safety gates.
-        Self::SafeCore
+    fn parse(contents: &str) -> Self {
+        contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("mode="))
+            .map(str::trim)
+            .map(|mode| match mode {
+                "extended" => Self::Extended,
+                _ => Self::SafeCore,
+            })
+            .unwrap_or_default()
     }
 
     fn as_config(self) -> &'static str {
-        // Do not persist an Extended request while the subsystem is unavailable.
-        // This also repairs older v0.4 test configs containing mode=extended.
-        "mode=safe-core\n"
+        match self {
+            Self::SafeCore => "mode=safe-core\n",
+            Self::Extended => "mode=extended\n",
+        }
     }
 }
 
@@ -71,15 +78,15 @@ mod tests {
     use super::FeatureMode;
 
     #[test]
-    fn all_persisted_modes_are_forced_to_safe_core() {
+    fn missing_or_unknown_mode_is_safe_core() {
         assert_eq!(FeatureMode::parse(""), FeatureMode::SafeCore);
         assert_eq!(FeatureMode::parse("mode=unknown\n"), FeatureMode::SafeCore);
-        assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::SafeCore);
     }
 
     #[test]
-    fn extended_request_is_not_effective_in_v04_rc() {
-        assert!(FeatureMode::Extended.safe_core());
-        assert_eq!(FeatureMode::Extended.as_config(), "mode=safe-core\n");
+    fn extended_mode_is_explicit_request() {
+        assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::Extended);
+        assert!(!FeatureMode::Extended.safe_core());
+        assert_eq!(FeatureMode::Extended.as_config(), "mode=extended\n");
     }
 }
