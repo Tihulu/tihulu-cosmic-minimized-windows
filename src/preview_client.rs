@@ -14,6 +14,7 @@ use crate::preview_ipc::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
+const SOFT_UNAVAILABLE_KEY: &str = "__tihulu_preview_soft_unavailable__";
 static CAPTURE_GATE: Semaphore = Semaphore::const_new(1);
 
 #[derive(Clone, Debug)]
@@ -36,7 +37,34 @@ pub(crate) async fn capture(key: String, identifier: String) -> Result<PreviewPa
         identifier,
     })
     .await?;
-    payload_from_response(response).await
+
+    match response {
+        Response::Error { message, .. } => soft_window_failure(message).await,
+        Response::Missing { key, .. } => {
+            soft_window_failure(format!("preview missing for {key}")).await
+        }
+        Response::Status {
+            state: PreviewState::Ready,
+            reason,
+            ..
+        } => soft_window_failure(
+            reason.unwrap_or_else(|| "preview is not ready for this window".to_owned()),
+        )
+        response => payload_from_response(response).await,
+    }
+}
+
+async fn soft_window_failure(error: String) -> Result<PreviewPayload, String> {
+    match health().await {
+        Ok(()) => Ok(PreviewPayload {
+            key: SOFT_UNAVAILABLE_KEY.to_owned(),
+            generation: 0,
+            width: 1,
+            height: 1,
+            rgba: Vec::new(),
+        }),
+        Err(health_error) => Err(format!("{error}; previewd health failed: {health_error}")),
+    }
 }
 
 pub(crate) async fn capture_many(
@@ -205,7 +233,7 @@ fn validate_thumbnail_path(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_THUMBNAIL_BYTES, expected_rgba_bytes};
+    use super::{MAX_THUMBNAIL_BYTES, SOFT_UNAVAILABLE_KEY, expected_rgba_bytes};
 
     #[test]
     fn rgba_byte_count_and_budget_are_bounded() {
@@ -213,5 +241,10 @@ mod tests {
         assert_eq!(bytes, 230_400);
         assert!(bytes < MAX_THUMBNAIL_BYTES);
         assert_eq!(expected_rgba_bytes(u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn soft_unavailable_key_cannot_match_real_identifier() {
+        assert!(SOFT_UNAVAILABLE_KEY.starts_with("__tihulu_preview_"));
     }
 }
