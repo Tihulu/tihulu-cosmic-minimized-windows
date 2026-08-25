@@ -47,10 +47,12 @@ pub(crate) async fn capture(key: String, identifier: String) -> Result<PreviewPa
             state: PreviewState::Ready,
             reason,
             ..
-        } => soft_window_failure(
-            reason.unwrap_or_else(|| "preview is not ready for this window".to_owned()),
-        )
-        .await,
+        } => {
+            soft_window_failure(
+                reason.unwrap_or_else(|| "preview is not ready for this window".to_owned()),
+            )
+            .await
+        }
         response => payload_from_response(response).await,
     }
 }
