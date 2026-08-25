@@ -603,10 +603,9 @@ impl cosmic::Application for MinimizedWindows {
                             .map(|entry| entry.identifier.clone());
                         let was_empty = self.windows.is_empty();
                         let became_minimized = previous_identifier.is_none();
-                        let identifier_became_available = previous_identifier
-                            .as_deref()
-                            .is_some_and(str::is_empty)
-                            && !new_identifier.is_empty();
+                        let identifier_became_available =
+                            previous_identifier.as_deref().is_some_and(str::is_empty)
+                                && !new_identifier.is_empty();
                         self.upsert(*info);
 
                         let preview = if (became_minimized || identifier_became_available)
