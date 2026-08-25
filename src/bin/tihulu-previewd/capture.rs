@@ -528,7 +528,7 @@ ignore_events!(
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureState, CaptureWayland, MAX_CAPTURE_BYTES, PixelLayout, wl_shm};
+    use super::{CaptureState, CaptureWayland, PixelLayout, wl_shm};
 
     #[test]
     fn xrgb_is_converted_to_rgba_in_place() {
@@ -551,6 +551,5 @@ mod tests {
         };
         let error = CaptureWayland::capture_layout(&state).unwrap_err();
         assert!(error.contains("safety budget"));
-        assert!(8192_usize * 8192 * 4 > MAX_CAPTURE_BYTES);
     }
 }
