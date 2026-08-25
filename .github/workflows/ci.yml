@@ -29,7 +29,17 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Check
-        run: cargo check --all-targets
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --all-targets --message-format=short 2>&1 | tee check.log
+      - name: Upload Check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-log
+          path: check.log
+          if-no-files-found: ignore
       - name: Test
         run: cargo test --all-targets
       - name: Clippy
