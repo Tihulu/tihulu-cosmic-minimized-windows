@@ -25,20 +25,29 @@ cleanup() {
   if [ -n "$MONITOR_PID" ]; then
     kill "$MONITOR_PID" 2>/dev/null || true
     wait "$MONITOR_PID" 2>/dev/null || true
+    MONITOR_PID=""
   fi
   if [ "$SERVICE_STOPPED_BY_TEST" -eq 1 ]; then
     systemctl --user start "$SERVICE" >/dev/null 2>&1 || true
+    SERVICE_STOPPED_BY_TEST=0
   fi
 }
-trap cleanup EXIT INT TERM
 
-for cmd in systemctl journalctl pgrep awk find du readlink wc date sleep; do
+on_signal() {
+  cleanup
+  exit 130
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM
+
+for cmd in systemctl journalctl pgrep awk find du readlink wc date sleep grep cat; do
   need "$cmd"
 done
 
 mkdir -p "$RUN_DIR"
 printf 'check\tresult\n' > "$MANUAL"
-printf '%s\n' 'preflight' > "$PHASE_FILE"
+printf '%s\n' preflight > "$PHASE_FILE"
 
 set_phase() {
   printf '%s\n' "$1" > "$PHASE_FILE"
@@ -51,9 +60,7 @@ confirm() {
   printf 'Pass this check? [y/N]: '
   IFS= read -r answer || answer=""
   case "$answer" in
-    y|Y|yes|YES|Yes)
-      printf '%s\tPASS\n' "$key" >> "$MANUAL"
-      ;;
+    y|Y|yes|YES|Yes) printf '%s\tPASS\n' "$key" >> "$MANUAL" ;;
     *)
       printf '%s\tFAIL\n' "$key" >> "$MANUAL"
       MANUAL_FAIL=1
@@ -104,7 +111,8 @@ first_pid() {
 }
 
 sample_row() {
-  local phase pp cp pfd prss pmem pcap cfd crss cmem ccap cache_files=0 cache_bytes=0 counts
+  local phase pp cp pfd prss pmem pcap cfd crss cmem ccap counts
+  local cache_files=0 cache_bytes=0
   phase="$(cat "$PHASE_FILE" 2>/dev/null || printf unknown)"
   pp="$(first_pid previewd)"
   cp="$(first_pid comp)"
@@ -153,9 +161,7 @@ resource_summary() {
   awk -F, '
     NR == 1 { next }
     {
-      if (NR == 2) {
-        pfd0=$4; cfd0=$9; pcap0=$7; ccap0=$12
-      }
+      if (NR == 2) { pfd0=$4; cfd0=$9; pcap0=$7; ccap0=$12 }
       pfd=$4; cfd=$9; pcap=$7; ccap=$12
       if ($4 > pfdmax) pfdmax=$4
       if ($9 > cfdmax) cfdmax=$9
@@ -165,13 +171,13 @@ resource_summary() {
       if ($14 > cachebytesmax) cachebytesmax=$14
     }
     END {
-      printf "previewd FD        start=%s end=%s max=%s\n", pfd0, pfd, pfdmax
-      printf "cosmic-comp FD     start=%s end=%s max=%s\n", cfd0, cfd, cfdmax
-      printf "previewd cap-memfd start=%s end=%s\n", pcap0, pcap
-      printf "comp cap-memfd     start=%s end=%s\n", ccap0, ccap
-      printf "previewd RSS max   %s KiB\n", prssmax
+      printf "previewd FD         start=%s end=%s max=%s\n", pfd0, pfd, pfdmax
+      printf "cosmic-comp FD      start=%s end=%s max=%s\n", cfd0, cfd, cfdmax
+      printf "previewd cap-memfd  start=%s end=%s\n", pcap0, pcap
+      printf "comp cap-memfd      start=%s end=%s\n", ccap0, ccap
+      printf "previewd RSS max    %s KiB\n", prssmax
       printf "cosmic-comp RSS max %s KiB\n", crssmax
-      printf "cache max          %s files / %s bytes\n", cachemax, cachebytesmax
+      printf "cache max           %s files / %s bytes\n", cachemax, cachebytesmax
     }
   ' "$CSV"
 }
@@ -179,17 +185,18 @@ resource_summary() {
 check_nonmonotonic_growth() {
   local column="$1" label="$2"
   if awk -F, -v col="$column" '
+      BEGIN { nondec=1 }
       NR == 1 { next }
       $2 ~ /^(safe-core|extended|hover|churn)$/ && $col ~ /^[0-9]+$/ {
         v=$col+0
-        if (!seen) { first=v; prev=v; seen=1; count=1; next }
+        if (!seen) { first=v; last=v; prev=v; seen=1; count=1; next }
         count++
         if (v < prev) nondec=0
         prev=v; last=v
       }
       END {
         if (!seen || count < 6) exit 0
-        if (nondec != 0 && (last-first) >= 4) exit 1
+        if (nondec && (last-first) >= 4) exit 1
         exit 0
       }
     ' "$CSV"; then
@@ -269,15 +276,14 @@ post_login_mode() {
   confirm post-login "After logout/login: the applet is present, grouping/restore/close work, persisted mode is correct, and previews recover when Extended is persisted and previewd is healthy."
   collect_bundle
   if [ "$MANUAL_FAIL" -eq 0 ] && [ "$AUTO_FAIL" -eq 0 ]; then
-    printf '\nVERDICT: POST-LOGIN PASS\n'
-    printf 'Bundle: %s\n' "$RUN_DIR"
+    printf '\nVERDICT: POST-LOGIN PASS\nBundle: %s\n' "$RUN_DIR"
     exit 0
   fi
   printf '\nVERDICT: POST-LOGIN FAIL\nBundle: %s\n' "$RUN_DIR"
   exit 2
 }
 
-if [ "$MODE" = "post-login" ]; then
+if [ "$MODE" = post-login ]; then
   post_login_mode
 fi
 
@@ -296,7 +302,7 @@ confirm extended "Thumbnails appear for the correct windows and the popup says: 
 
 set_phase hover
 printf '\nPerform 100+ icon-to-popup hover cycles. Exercise Brave with 2, then 3, 4 and 5 minimized windows, and rapidly switch to another minimized app group.\n'
-confirm hover "Hover stays cache-only from the UI perspective: no blank/mismatched previews, wrong group, stale close, popup jump or crash."
+confirm hover "No blank/mismatched previews, wrong group, stale close, popup jump or crash occur during the hover stress."
 
 set_phase churn
 printf '\nPerform at least 20 restore/minimize/close/new-window cycles while previews are enabled.\n'
@@ -331,7 +337,7 @@ sleep 16
 confirm restart-on-failure "After SIGKILL and automatic service restart, previews recover and the applet remains responsive."
 
 set_phase multi-monitor
-printf '\nIf two monitors are available, test windows from both monitors, group switching and exact restore. If not available, answer y to mark this environment as single-monitor and record that coverage remains pending.\n'
+printf '\nIf two monitors are available, test windows from both monitors, group switching and exact restore. If not, mark this environment as single-monitor; two-monitor coverage remains pending.\n'
 confirm multi-monitor "Two-monitor behavior passed, OR this machine currently has only one monitor and you accept that two-monitor coverage remains pending."
 
 set_phase final
@@ -344,7 +350,11 @@ resource_summary
 automated_checks
 
 printf '\nManual checks:\n'
-column -t -s $'\t' "$MANUAL" 2>/dev/null || cat "$MANUAL"
+if command -v column >/dev/null 2>&1; then
+  column -t -s $'\t' "$MANUAL"
+else
+  cat "$MANUAL"
+fi
 
 if [ "$MANUAL_FAIL" -eq 0 ] && [ "$AUTO_FAIL" -eq 0 ]; then
   printf '\nVERDICT: PASS CANDIDATE — live preview/runtime checks passed.\n'
@@ -354,6 +364,5 @@ if [ "$MANUAL_FAIL" -eq 0 ] && [ "$AUTO_FAIL" -eq 0 ]; then
   exit 0
 fi
 
-printf '\nVERDICT: FAIL — do not merge previewd.\n'
-printf 'Failure bundle: %s\n' "$RUN_DIR"
+printf '\nVERDICT: FAIL — do not merge previewd.\nFailure bundle: %s\n' "$RUN_DIR"
 exit 2
