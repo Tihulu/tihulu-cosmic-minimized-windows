@@ -11,7 +11,7 @@ use crate::preview_ipc::{
     PROTOCOL_VERSION, PreviewState, Request, Response, preview_dir, socket_path,
 };
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -31,6 +31,53 @@ pub(crate) async fn capture(key: String, identifier: String) -> Result<PreviewPa
     })
     .await?;
     payload_from_response(response).await
+}
+
+pub(crate) async fn capture_many(
+    requests: Vec<(String, String)>,
+) -> Vec<(String, Result<PreviewPayload, String>)> {
+    let mut results = Vec::with_capacity(requests.len());
+    for (key, identifier) in requests {
+        let response_key = key.clone();
+        let result = capture(key, identifier).await;
+        let failed = result.is_err();
+        results.push((response_key, result));
+        if failed {
+            break;
+        }
+    }
+    results
+}
+
+pub(crate) async fn health() -> Result<(), String> {
+    match request(Request::Status {
+        version: PROTOCOL_VERSION,
+    })
+    .await?
+    {
+        Response::Status {
+            version,
+            state,
+            reason,
+        } => {
+            if version != PROTOCOL_VERSION {
+                return Err(format!("preview protocol mismatch: {version}"));
+            }
+            match state {
+                PreviewState::Ready => Ok(()),
+                PreviewState::Degraded => {
+                    Err(reason.unwrap_or_else(|| "previewd is degraded".to_owned()))
+                }
+                PreviewState::Disabled => {
+                    Err(reason.unwrap_or_else(|| "previewd is disabled".to_owned()))
+                }
+            }
+        }
+        Response::Error { message, .. } => Err(message),
+        Response::Hello { .. }
+        | Response::Thumbnail { .. }
+        | Response::Missing { .. } => Err("unexpected previewd health response".to_owned()),
+    }
 }
 
 pub(crate) async fn gone(key: String) {
