@@ -3,6 +3,7 @@
 use std::{collections::HashMap, os::fd::AsFd};
 
 use cctk::wayland_client::{
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
     backend::ObjectId,
     event_created_child,
     protocol::{
@@ -11,7 +12,6 @@ use cctk::wayland_client::{
         wl_shm::{self, WlShm},
         wl_shm_pool::WlShmPool,
     },
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
 use cctk::wayland_protocols::ext::{
     foreign_toplevel_list::v1::client::{
@@ -115,9 +115,7 @@ impl ProbeWayland {
 
     pub(crate) fn verify_capture_globals(&self) -> Result<(), String> {
         if self.state.copy_mgr.is_none() {
-            return Err(
-                "compositor does not expose ext_image_copy_capture_manager_v1".to_owned(),
-            );
+            return Err("compositor does not expose ext_image_copy_capture_manager_v1".to_owned());
         }
         if self.state.source_mgr.is_none() {
             return Err(
@@ -131,10 +129,7 @@ impl ProbeWayland {
         Ok(())
     }
 
-    pub(crate) fn capture_once(
-        &mut self,
-        source: &ExtImageCaptureSourceV1,
-    ) -> Result<(), String> {
+    pub(crate) fn capture_once(&mut self, source: &ExtImageCaptureSourceV1) -> Result<(), String> {
         let copy_mgr = self.state.copy_mgr.clone().ok_or_else(|| {
             "ext_image_copy_capture_manager_v1 disappeared from probe state".to_owned()
         })?;
@@ -296,8 +291,7 @@ impl ProbeWayland {
         let size_u32 = stride
             .checked_mul(height)
             .ok_or_else(|| format!("buffer size overflow for {width}x{height}"))?;
-        let size =
-            usize::try_from(size_u32).map_err(|_| "buffer does not fit usize".to_owned())?;
+        let size = usize::try_from(size_u32).map_err(|_| "buffer does not fit usize".to_owned())?;
         let size_i32 =
             i32::try_from(size).map_err(|_| format!("buffer too large: {size} bytes"))?;
         Ok((width, height, stride, size, size_i32, format))
@@ -344,18 +338,14 @@ impl Dispatch<WlRegistry, ()> for State {
                 (),
             ));
         } else if interface == ExtForeignToplevelImageCaptureSourceManagerV1::interface().name {
-            state.source_mgr = Some(registry.bind::<
-                ExtForeignToplevelImageCaptureSourceManagerV1,
-                _,
-                _,
-            >(
-                name,
-                version.min(
-                    ExtForeignToplevelImageCaptureSourceManagerV1::interface().version,
+            state.source_mgr = Some(
+                registry.bind::<ExtForeignToplevelImageCaptureSourceManagerV1, _, _>(
+                    name,
+                    version.min(ExtForeignToplevelImageCaptureSourceManagerV1::interface().version),
+                    qh,
+                    (),
                 ),
-                qh,
-                (),
-            ));
+            );
         }
     }
 }
