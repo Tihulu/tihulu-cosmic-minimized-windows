@@ -29,6 +29,7 @@ use crate::{
 
 const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
+const PREVIEW_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const POPUP_WIDTH: f32 = 340.0;
 const POPUP_MAX_HEIGHT: f32 = 420.0;
 const SAFE_ROW_HEIGHT_ESTIMATE: f32 = 52.0;
@@ -75,6 +76,7 @@ struct MinimizedWindows {
     feature_mode: FeatureMode,
     previews: HashMap<String, PreviewEntry>,
     preview_healthy: bool,
+    preview_health_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,9 @@ enum Message {
     PopupClosed(WindowId),
     ToggleSafeCore(bool),
     PreviewLoaded(String, Result<Arc<PreviewPayload>, String>),
+    PreviewBatchLoaded(Vec<(String, Result<Arc<PreviewPayload>, String>)>),
+    PreviewHealthTick(u64),
+    PreviewHealthChecked(u64, Result<(), String>),
     PreviewMaintenanceDone,
 }
 
@@ -357,18 +362,40 @@ impl MinimizedWindows {
     }
 
     fn capture_all_task(&self) -> Task<Message> {
-        let tasks = self
+        let requests = self
             .windows
             .iter()
             .filter(|entry| !entry.identifier.is_empty())
             .take(MAX_APPLET_PREVIEWS)
-            .map(Self::capture_task)
+            .map(|entry| (entry.identifier.clone(), entry.identifier.clone()))
             .collect::<Vec<_>>();
-        if tasks.is_empty() {
-            cosmic::task::none()
-        } else {
-            Task::batch(tasks)
+        if requests.is_empty() {
+            return cosmic::task::none();
         }
+        Task::perform(preview_client::capture_many(requests), |results| {
+            cosmic::Action::App(Message::PreviewBatchLoaded(
+                results
+                    .into_iter()
+                    .map(|(key, result)| (key, result.map(Arc::new)))
+                    .collect(),
+            ))
+        })
+    }
+
+    fn health_delay_task(generation: u64) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::time::sleep(PREVIEW_HEALTH_INTERVAL).await;
+                generation
+            },
+            |generation| cosmic::Action::App(Message::PreviewHealthTick(generation)),
+        )
+    }
+
+    fn health_check_task(generation: u64) -> Task<Message> {
+        Task::perform(preview_client::health(), move |result| {
+            cosmic::Action::App(Message::PreviewHealthChecked(generation, result))
+        })
     }
 
     fn gone_task(identifier: Option<String>) -> Task<Message> {
@@ -547,6 +574,14 @@ impl MinimizedWindows {
         );
         self.preview_healthy = true;
     }
+
+    fn preview_failed(&mut self, key: &str, error: &str) {
+        if self.windows.iter().any(|entry| entry.identifier == key) {
+            self.preview_healthy = false;
+            self.previews.clear();
+            tracing::warn!(?error, "previewd unavailable; Safe Core fallback active");
+        }
+    }
 }
 
 impl cosmic::Application for MinimizedWindows {
@@ -569,7 +604,12 @@ impl cosmic::Application for MinimizedWindows {
             app.core.main_window_id().unwrap(),
             true,
         );
-        (app, hide)
+        if app.feature_mode.safe_core() {
+            (app, hide)
+        } else {
+            let health = Self::health_delay_task(app.preview_health_generation);
+            (app, Task::batch([hide, health]))
+        }
     }
 
     fn core(&self) -> &cosmic::app::Core {
@@ -715,6 +755,8 @@ impl cosmic::Application for MinimizedWindows {
                 if let Err(error) = config::save_feature_mode(self.feature_mode) {
                     tracing::warn!(?error, "Could not persist Safe Core setting");
                 }
+                self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
+                let generation = self.preview_health_generation;
                 self.preview_healthy = false;
                 if enabled {
                     self.previews.clear();
@@ -722,18 +764,49 @@ impl cosmic::Application for MinimizedWindows {
                         cosmic::Action::App(Message::PreviewMaintenanceDone)
                     });
                 }
-                return self.capture_all_task();
+                return Task::batch([self.capture_all_task(), Self::health_delay_task(generation)]);
             }
             Message::PreviewLoaded(key, result) => match result {
                 Ok(payload) => self.accept_preview(key, payload),
-                Err(error) => {
-                    if self.windows.iter().any(|entry| entry.identifier == key) {
-                        self.preview_healthy = false;
-                        self.previews.clear();
-                        tracing::warn!(?error, "previewd unavailable; Safe Core fallback active");
+                Err(error) => self.preview_failed(&key, &error),
+            },
+            Message::PreviewBatchLoaded(results) => {
+                for (key, result) in results {
+                    match result {
+                        Ok(payload) => self.accept_preview(key, payload),
+                        Err(error) => self.preview_failed(&key, &error),
                     }
                 }
-            },
+            }
+            Message::PreviewHealthTick(generation) => {
+                if generation == self.preview_health_generation && !self.feature_mode.safe_core() {
+                    return Self::health_check_task(generation);
+                }
+            }
+            Message::PreviewHealthChecked(generation, result) => {
+                if generation != self.preview_health_generation || self.feature_mode.safe_core() {
+                    return cosmic::task::none();
+                }
+
+                let recovery = match result {
+                    Ok(()) => {
+                        if self.preview_healthy {
+                            cosmic::task::none()
+                        } else {
+                            self.capture_all_task()
+                        }
+                    }
+                    Err(error) => {
+                        if self.preview_healthy || !self.previews.is_empty() {
+                            tracing::warn!(?error, "previewd health check failed; Safe Core fallback active");
+                        }
+                        self.preview_healthy = false;
+                        self.previews.clear();
+                        cosmic::task::none()
+                    }
+                };
+                return Task::batch([recovery, Self::health_delay_task(generation)]);
+            }
             Message::PreviewMaintenanceDone => {}
         }
 
