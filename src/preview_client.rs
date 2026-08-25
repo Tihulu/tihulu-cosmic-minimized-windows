@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::Path, time::Duration};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -88,6 +88,17 @@ async fn request_inner(request: Request) -> Result<Response, String> {
     serde_json::from_str(&line).map_err(|error| format!("preview response decode failed: {error}"))
 }
 
+fn expected_rgba_bytes(width: u32, height: u32) -> Option<usize> {
+    usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+}
+
 async fn payload_from_response(response: Response) -> Result<PreviewPayload, String> {
     match response {
         Response::Thumbnail {
@@ -102,14 +113,7 @@ async fn payload_from_response(response: Response) -> Result<PreviewPayload, Str
                 return Err(format!("preview protocol mismatch: {version}"));
             }
             validate_thumbnail_path(&path)?;
-            let expected = usize::try_from(width)
-                .ok()
-                .and_then(|width| {
-                    usize::try_from(height)
-                        .ok()
-                        .and_then(|height| width.checked_mul(height))
-                })
-                .and_then(|pixels| pixels.checked_mul(4))
+            let expected = expected_rgba_bytes(width, height)
                 .ok_or_else(|| "thumbnail dimensions overflow".to_owned())?;
             if expected == 0 || expected > MAX_THUMBNAIL_BYTES {
                 return Err(format!("thumbnail byte size outside budget: {expected}"));
@@ -142,7 +146,7 @@ async fn payload_from_response(response: Response) -> Result<PreviewPayload, Str
     }
 }
 
-fn validate_thumbnail_path(path: &PathBuf) -> Result<(), String> {
+fn validate_thumbnail_path(path: &Path) -> Result<(), String> {
     let root = preview_dir().ok_or_else(|| "preview cache root unavailable".to_owned())?;
     if !path.starts_with(&root) {
         return Err("previewd returned a path outside its runtime cache".to_owned());
@@ -152,10 +156,13 @@ fn validate_thumbnail_path(path: &PathBuf) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_THUMBNAIL_BYTES;
+    use super::{MAX_THUMBNAIL_BYTES, expected_rgba_bytes};
 
     #[test]
-    fn client_budget_covers_sixteen_320x180_rgba_files_individually() {
-        assert!(320 * 180 * 4 < MAX_THUMBNAIL_BYTES);
+    fn rgba_byte_count_and_budget_are_bounded() {
+        let bytes = expected_rgba_bytes(320, 180).unwrap();
+        assert_eq!(bytes, 230_400);
+        assert!(bytes < MAX_THUMBNAIL_BYTES);
+        assert_eq!(expected_rgba_bytes(u32::MAX, u32::MAX), None);
     }
 }
