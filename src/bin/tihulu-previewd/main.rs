@@ -30,6 +30,7 @@ const TARGET_WIDTH: u32 = 320;
 const TARGET_HEIGHT: u32 = 180;
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const RSS_BREAKER_KB: u64 = 128 * 1024;
+const BLANK_RGB_THRESHOLD: u8 = 8;
 
 #[derive(Clone, Debug)]
 struct CacheEntry {
@@ -212,6 +213,15 @@ impl Daemon {
             }
         };
         let thumb = resize_fit(frame, TARGET_WIDTH, TARGET_HEIGHT);
+        if frame_is_effectively_blank(&thumb) {
+            if let Some(entry) = self.cache.get(key) {
+                return thumbnail_response(entry);
+            }
+            return Response::Error {
+                version: PROTOCOL_VERSION,
+                message: "capture returned an effectively blank frame".to_owned(),
+            };
+        }
         let entry = match self
             .cache
             .insert(key.to_owned(), thumb.width, thumb.height, &thumb.rgba)
@@ -280,6 +290,24 @@ fn hash_key(key: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
+}
+
+fn frame_is_effectively_blank(frame: &CapturedFrame) -> bool {
+    let mut pixels = frame.rgba.chunks_exact(4);
+    let Some(first) = pixels.next() else {
+        return true;
+    };
+    if first[0] > BLANK_RGB_THRESHOLD
+        || first[1] > BLANK_RGB_THRESHOLD
+        || first[2] > BLANK_RGB_THRESHOLD
+    {
+        return false;
+    }
+    pixels.all(|pixel| {
+        pixel[0] <= BLANK_RGB_THRESHOLD
+            && pixel[1] <= BLANK_RGB_THRESHOLD
+            && pixel[2] <= BLANK_RGB_THRESHOLD
+    })
 }
 
 fn resize_fit(frame: CapturedFrame, max_width: u32, max_height: u32) -> CapturedFrame {
@@ -417,7 +445,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapturedFrame, resize_fit};
+    use super::{CapturedFrame, frame_is_effectively_blank, resize_fit};
 
     #[test]
     fn resize_keeps_widescreen_inside_320x180() {
@@ -441,5 +469,27 @@ mod tests {
         let thumb = resize_fit(frame, 320, 180);
         assert_eq!(thumb.height, 180);
         assert!(thumb.width < 180);
+    }
+
+    #[test]
+    fn blank_frame_is_rejected() {
+        let frame = CapturedFrame {
+            width: 4,
+            height: 4,
+            rgba: vec![0; 4 * 4 * 4],
+        };
+        assert!(frame_is_effectively_blank(&frame));
+    }
+
+    #[test]
+    fn dark_frame_with_visible_content_is_kept() {
+        let mut rgba = vec![0; 4 * 4 * 4];
+        rgba[8] = 64;
+        let frame = CapturedFrame {
+            width: 4,
+            height: 4,
+            rgba,
+        };
+        assert!(!frame_is_effectively_blank(&frame));
     }
 }
