@@ -798,7 +798,10 @@ impl cosmic::Application for MinimizedWindows {
                     }
                     Err(error) => {
                         if self.preview_healthy || !self.previews.is_empty() {
-                            tracing::warn!(?error, "previewd health check failed; Safe Core fallback active");
+                            tracing::warn!(
+                                ?error,
+                                "previewd health check failed; Safe Core fallback active"
+                            );
                         }
                         self.preview_healthy = false;
                         self.previews.clear();
