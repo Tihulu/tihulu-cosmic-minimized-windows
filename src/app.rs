@@ -351,15 +351,9 @@ impl MinimizedWindows {
         let key = entry.identifier.clone();
         let identifier = entry.identifier.clone();
         let response_key = key.clone();
-        Task::perform(
-            preview_client::capture(key, identifier),
-            move |result| {
-                cosmic::Action::App(Message::PreviewLoaded(
-                    response_key,
-                    result.map(Arc::new),
-                ))
-            },
-        )
+        Task::perform(preview_client::capture(key, identifier), move |result| {
+            cosmic::Action::App(Message::PreviewLoaded(response_key, result.map(Arc::new)))
+        })
     }
 
     fn capture_all_task(&self) -> Task<Message> {
@@ -525,10 +519,7 @@ impl MinimizedWindows {
     fn accept_preview(&mut self, key: String, payload: Arc<PreviewPayload>) {
         if self.feature_mode.safe_core()
             || payload.key != key
-            || !self
-                .windows
-                .iter()
-                .any(|entry| entry.identifier == key)
+            || !self.windows.iter().any(|entry| entry.identifier == key)
         {
             return;
         }
@@ -604,14 +595,23 @@ impl cosmic::Application for MinimizedWindows {
                 BridgeEvent::Window(delta) => match *delta {
                     WindowDelta::Present(info) => {
                         let handle = info.foreign_toplevel.clone();
-                        let was_empty = self.windows.is_empty();
-                        let became_minimized = !self
+                        let new_identifier = info.identifier.trim().to_owned();
+                        let previous_identifier = self
                             .windows
                             .iter()
-                            .any(|entry| entry.handle == handle);
+                            .find(|entry| entry.handle == handle)
+                            .map(|entry| entry.identifier.clone());
+                        let was_empty = self.windows.is_empty();
+                        let became_minimized = previous_identifier.is_none();
+                        let identifier_became_available = previous_identifier
+                            .as_deref()
+                            .is_some_and(str::is_empty)
+                            && !new_identifier.is_empty();
                         self.upsert(*info);
 
-                        let preview = if became_minimized && !self.feature_mode.safe_core() {
+                        let preview = if (became_minimized || identifier_became_available)
+                            && !self.feature_mode.safe_core()
+                        {
                             self.windows
                                 .iter()
                                 .find(|entry| entry.handle == handle)
