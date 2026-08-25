@@ -66,6 +66,10 @@ async fn request_inner(request: Request) -> Result<Response, String> {
         .write_all(&encoded)
         .await
         .map_err(|error| format!("preview request write failed: {error}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|error| format!("preview request shutdown failed: {error}"))?;
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -95,7 +99,11 @@ async fn payload_from_response(response: Response) -> Result<PreviewPayload, Str
             validate_thumbnail_path(&path)?;
             let expected = usize::try_from(width)
                 .ok()
-                .and_then(|width| usize::try_from(height).ok().and_then(|height| width.checked_mul(height)))
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
                 .and_then(|pixels| pixels.checked_mul(4))
                 .ok_or_else(|| "thumbnail dimensions overflow".to_owned())?;
             if expected == 0 || expected > MAX_THUMBNAIL_BYTES {
