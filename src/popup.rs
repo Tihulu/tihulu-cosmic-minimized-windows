@@ -129,10 +129,7 @@ impl PopupFsm {
                 }
             }
             PopupState::Pinned(session) => {
-                if !pinned {
-                    self.state = PopupState::Pinned(session);
-                    OpenPlan::None
-                } else if session.group == group {
+                if !pinned || session.group == group {
                     self.state = PopupState::Pinned(session);
                     OpenPlan::None
                 } else {
