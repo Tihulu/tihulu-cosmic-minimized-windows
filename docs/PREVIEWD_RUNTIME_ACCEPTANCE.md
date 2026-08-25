@@ -6,16 +6,24 @@ This test is mandatory before the `feature/previewd` branch can be merged or pro
 
 The preferred path is the guided runtime runner. It samples previewd and compositor resources every two seconds, records a CSV and failure bundle, performs daemon stop/recovery and SIGKILL restart tests, checks cache/FD caps and monotonic FD/capture-memfd growth, and asks for explicit UI pass/fail confirmation at each phase.
 
-Install the exact candidate first, remove/re-add the applet in COSMIC Settings, then run:
+Current runtime-test candidate: `e438780974bc3fcdb03e35d00b3690584a981e07`.
+
+Install that exact candidate first:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/run-previewd-runtime-test.sh)
+REF=e438780974bc3fcdb03e35d00b3690584a981e07 bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/e438780974bc3fcdb03e35d00b3690584a981e07/scripts/quick-install.sh)
+```
+
+Remove/re-add the applet in COSMIC Settings, then run the exact runner from the same candidate:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/e438780974bc3fcdb03e35d00b3690584a981e07/scripts/run-previewd-runtime-test.sh)
 ```
 
 A successful first-stage run ends with `VERDICT: PASS CANDIDATE`. Logout/login coverage is still required before merge; after logging back in run:
 
 ```bash
-MODE=post-login bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/run-previewd-runtime-test.sh)
+MODE=post-login bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/e438780974bc3fcdb03e35d00b3690584a981e07/scripts/run-previewd-runtime-test.sh)
 ```
 
 The runner stores its CSV, manual check results, service status, journal and process snapshots under `~/tihulu-previewd-runtime-results/`. A runner `FAIL` means the branch must not be merged.
@@ -24,11 +32,7 @@ The manual procedure below remains the reference for what each runner phase is v
 
 ## 1. Install the candidate
 
-```bash
-REF=feature/previewd bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/quick-install.sh)
-```
-
-Then remove the existing **Tihulu Minimized Windows** applet from the COSMIC dock/panel and add it again.
+Use the pinned candidate command above. Then remove the existing **Tihulu Minimized Windows** applet from the COSMIC dock/panel and add it again.
 
 Verify the user daemon:
 
@@ -42,156 +46,51 @@ Expected: the service is `active` and the journal contains a `tihulu-previewd re
 
 ## 2. Start the resource watcher
 
-Keep this running in a terminal during the complete test:
+Keep this running in a terminal during the complete manual test:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/watch-previewd-resources.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/e438780974bc3fcdb03e35d00b3690584a981e07/scripts/watch-previewd-resources.sh)
 ```
 
-The watcher reports:
-
-- applet FD, RSS, RssShmem, memfd and capture-related memfd
-- `tihulu-previewd` FD, RSS, RssShmem, memfd and capture-related memfd
-- all matching `cosmic-panel` process metrics
-- `cosmic-comp` metrics
-- preview cache file count and byte size
-
-Record the initial values before enabling previews.
+The watcher reports applet, previewd, panel and compositor FD/RSS/shmem/memfd metrics plus preview-cache usage.
 
 ## 3. Safe Core baseline
 
-Safe Core should be enabled initially.
-
-1. Minimize two Brave windows.
-2. Hover the Brave group repeatedly.
-3. Open/pin the group popup.
-4. Restore one window and minimize it again.
-5. Close one minimized window from the popup.
-
-Expected:
-
-- title/icon rows only
-- grouping/restore/close work correctly
-- no preview capture activity is required
-- popup does not disappear because of stale hover timers
-- resource counts remain bounded
+Safe Core should be enabled initially. Minimize two Brave windows, stress hover/pin, restore/minimize and exact close. Expect title/icon rows only, correct grouping and bounded resources.
 
 ## 4. Enable Extended mode
 
-With at least two minimized windows visible in a group popup, turn **Safe Core mode** off.
-
-Expected when the daemon is healthy:
+With at least two minimized windows visible in a group popup, turn **Safe Core mode** off. Expected when healthy:
 
 ```text
 Window previews are provided by tihulu-previewd. Media controls are not enabled yet.
 ```
 
-Existing minimized windows should be captured sequentially and their cached thumbnails should appear. Newly minimized windows should be captured once when they enter the minimized set.
-
-The preview cache must remain within:
-
-- maximum 16 `.rgba` files
-- maximum 8 MiB total daemon thumbnail cache
-- approximately 320x180 maximum target thumbnail size per window
+Existing minimized windows should be captured sequentially and newly minimized windows once. Cache limits are 16 `.rgba` files and 8 MiB total, with approximately 320x180 target thumbnails.
 
 ## 5. Hover stress
 
-Perform at least 100 icon-to-popup hover cycles across minimized groups.
-
-Test Brave with 2, then 3, 4 and 5 minimized windows. Also switch rapidly between Brave and at least one other minimized application group.
-
-Expected:
-
-- hover reads cached previews only
-- hover must not cause a new capture every time
-- the popup follows the correct group and anchor
-- no stale popup closes a newer popup
-- no blank/mismatched preview belongs to another window
-- applet/daemon/compositor FD and capture-related memfd counts oscillate within a bounded range instead of increasing monotonically
+Perform at least 100 icon-to-popup hover cycles. Test Brave with 2, 3, 4 and 5 minimized windows and rapidly switch to another minimized application group. Hover must read cache only, with no wrong preview, stale close, popup-anchor regression or monotonic FD/memfd growth.
 
 ## 6. Restore/close churn
 
-Repeat for at least 20 cycles:
-
-1. Restore a minimized window by clicking its thumbnail.
-2. Minimize it again.
-3. Close another minimized window from the popup.
-4. Open a new application window and minimize it.
-
-Expected:
-
-- removed windows disappear from both UI and preview cache
-- newly minimized windows receive one fresh preview
-- cache count never exceeds 16
-- restore/close targets the exact intended window
-- no persistent FD/memfd growth
+Repeat at least 20 cycles of restore, minimize, close and new-window minimize. Removed windows must disappear from UI/cache, new minimized windows must receive one preview, exact-window actions must remain correct, and resource growth must stay bounded.
 
 ## 7. Daemon failure fallback
 
-While Extended mode is enabled and previews are visible:
-
-```bash
-systemctl --user stop tihulu-previewd.service
-```
-
-Wait at least 15 seconds and reopen the group popup.
-
-Expected:
-
-- title/icon Safe Core rows remain usable
-- previews are cleared from the applet
-- grouping/restore/close continue to work
-- the popup reports that Extended mode was requested but Safe Core fallback is active
-- the applet itself does not crash or hang
+Stop previewd while Extended mode is active, wait at least 15 seconds and reopen the popup. Expected: title/icon Safe Core rows remain usable, previews clear, restore/close continue working and the popup reports Safe Core fallback.
 
 ## 8. Daemon recovery
 
-Restart the daemon:
-
-```bash
-systemctl --user start tihulu-previewd.service
-```
-
-Wait up to roughly 15 seconds.
-
-Expected:
-
-- health polling detects the daemon again
-- already minimized windows are re-captured sequentially
-- previews return without restarting `cosmic-panel`
-- Safe Core fallback remains available if recovery fails
-
-Also verify the service's restart-on-failure path once:
-
-```bash
-systemctl --user kill -s SIGKILL tihulu-previewd.service
-sleep 3
-systemctl --user is-active tihulu-previewd.service
-```
-
-Expected: systemd restarts the service and it becomes `active` again.
+Restart previewd and wait up to roughly 15 seconds. Existing minimized windows should re-capture sequentially and previews return without restarting `cosmic-panel`. Also SIGKILL previewd once and verify `Restart=on-failure` brings it back.
 
 ## 9. Two-monitor test
 
-If two monitors are available:
-
-1. Minimize windows from both monitors.
-2. Open groups repeatedly from the panel/dock.
-3. Restore windows originating on each display.
-4. Repeat hover and group switching while moving normal windows between monitors.
-
-Expected: no preview/group mix-ups, no popup lifetime regression, and no monotonic compositor resource growth.
+If two monitors are available, test minimized windows from both displays, group switching, exact restore and hover while moving normal windows between monitors. No preview/group mix-up or compositor growth is acceptable.
 
 ## 10. Logout/login test
 
-Logout and log back into the COSMIC session.
-
-Expected:
-
-- `tihulu-previewd.service` starts as a user service for the graphical session
-- stale runtime socket/cache state does not prevent startup
-- the applet starts in the persisted mode
-- if Extended was persisted and the daemon is healthy, previews recover; otherwise Safe Core remains functional
+Logout and log back in. `tihulu-previewd.service` must start for the graphical session; stale socket/cache state must not block startup; persisted mode must behave correctly; Extended should recover previews when the daemon is healthy.
 
 ## PASS criteria
 
@@ -203,31 +102,17 @@ The candidate passes only if all of the following are true:
 - previewd failure automatically falls back to Safe Core
 - previewd recovery restores previews without panel restart
 - daemon cache remains <=16 entries and <=8 MiB
-- previewd stays below its systemd `LimitNOFILE=256`
+- previewd stays below `LimitNOFILE=256`
 - no monotonically increasing previewd FD count
 - no monotonically increasing `cosmic-comp` FD count attributable to capture
 - no monotonically increasing compositor capture-related memfd count
-- daemon RSS remains bounded; its internal +128 MiB growth breaker must not trip during normal use
+- daemon RSS remains bounded and its +128 MiB breaker does not trip during normal use
 - repeated hover does not trigger repeated capture
 
 A bounded sequence such as `92 -> 93 -> 92 -> 93` is acceptable. A monotonic sequence such as `92 -> 93 -> 94 -> 95` is a failure.
 
 ## Failure bundle
 
-If anything fails, collect these outputs before restarting the session:
-
-```bash
-ONCE=1 bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/watch-previewd-resources.sh)
-
-systemctl --user status tihulu-previewd.service --no-pager
-journalctl --user -u tihulu-previewd.service --since '20 minutes ago' --no-pager
-
-printf '\nApplet processes:\n'
-pgrep -af tihulu-cosmic-minimized-windows || true
-printf '\nPreview daemon:\n'
-pgrep -af tihulu-previewd || true
-printf '\nCOSMIC compositor:\n'
-pgrep -af cosmic-comp || true
-```
+The guided runner automatically writes the bundle under `~/tihulu-previewd-runtime-results/`. For manual collection use the resource watcher, `systemctl --user status tihulu-previewd.service`, the previewd journal, and `pgrep -af` snapshots for the applet, previewd and cosmic-comp.
 
 Do not merge the branch when this acceptance test fails even if GitHub Actions is green.
