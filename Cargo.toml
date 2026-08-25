@@ -12,6 +12,7 @@ cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-c
 cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", default-features = false, features = ["client"], rev = "32283d7" }
 futures = "0.3"
 libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "ef490df50b0a05a21c494c3f75737581bf0b39d9", default-features = false, features = ["applet", "applet-token", "dbus-config", "multi-window", "tokio", "wayland", "desktop-systemd-scope", "winit"] }
+rustix = { version = "1", features = ["fs"] }
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1"
 tracing-log = "0.2"
@@ -20,4 +21,6 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 [profile.release]
 opt-level = 3
 lto = "thin"
+codegen-units = 1
 panic = "abort"
+strip = "symbols"
