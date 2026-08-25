@@ -22,7 +22,7 @@ use cosmic::{
 
 use crate::{
     config::{self, FeatureMode},
-    popup::{CloseGuard, OpenPlan, PopupFsm},
+    popup::{CloseGuard, CloseOutcome, OpenPlan, PopupFsm},
     preview_client::{self, PreviewPayload},
     wayland::{self, BridgeCommand, BridgeEvent, WindowDelta},
 };
@@ -316,14 +316,7 @@ impl MinimizedWindows {
         match self.popup.request_open(group, pinned, proposed_id) {
             OpenPlan::None => cosmic::task::none(),
             OpenPlan::Create { window_id, group } => self.popup_task(&group, window_id),
-            OpenPlan::Replace {
-                old_window_id,
-                window_id,
-                group,
-            } => Task::batch([
-                destroy_popup(old_window_id),
-                self.popup_task(&group, window_id),
-            ]),
+            OpenPlan::CloseForSwitch { old_window_id } => destroy_popup(old_window_id),
         }
     }
 
@@ -743,9 +736,14 @@ impl cosmic::Application for MinimizedWindows {
                     let _ = tx.send(BridgeCommand::Close(handle));
                 }
             }
-            Message::PopupClosed(id) => {
-                let _ = self.popup.compositor_closed(id);
-            }
+            Message::PopupClosed(id) => match self.popup.compositor_closed(id) {
+                CloseOutcome::Ignored | CloseOutcome::Closed => {}
+                CloseOutcome::OpenPending { group, pinned } => {
+                    if self.group_count(&group) > 0 {
+                        return self.open_group(group, pinned);
+                    }
+                }
+            },
             Message::ToggleSafeCore(enabled) => {
                 self.feature_mode = if enabled {
                     FeatureMode::SafeCore
