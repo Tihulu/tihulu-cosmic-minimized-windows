@@ -26,23 +26,15 @@ struct PendingOpen {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenPlan {
     None,
-    Create {
-        window_id: WindowId,
-        group: String,
-    },
-    CloseForSwitch {
-        old_window_id: WindowId,
-    },
+    Create { window_id: WindowId, group: String },
+    CloseForSwitch { old_window_id: WindowId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CloseOutcome {
     Ignored,
     Closed,
-    OpenPending {
-        group: String,
-        pinned: bool,
-    },
+    OpenPending { group: String, pinned: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,9 +296,7 @@ mod tests {
 
         assert_eq!(
             fsm.request_open("firefox".into(), false, WindowId::unique()),
-            OpenPlan::CloseForSwitch {
-                old_window_id: old
-            }
+            OpenPlan::CloseForSwitch { old_window_id: old }
         );
         assert_eq!(fsm.active_group(), Some("brave"));
         assert_eq!(
@@ -366,9 +356,7 @@ mod tests {
         fsm.request_open("brave".into(), true, old);
         assert_eq!(
             fsm.request_open("spotify".into(), true, WindowId::unique()),
-            OpenPlan::CloseForSwitch {
-                old_window_id: old
-            }
+            OpenPlan::CloseForSwitch { old_window_id: old }
         );
         assert_eq!(
             fsm.compositor_closed(old),
