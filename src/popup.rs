@@ -24,6 +24,7 @@ pub(crate) enum OpenPlan {
         window_id: WindowId,
         group: String,
     },
+    #[allow(dead_code)]
     Replace {
         old_window_id: WindowId,
         window_id: WindowId,
