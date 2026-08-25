@@ -85,9 +85,6 @@ mod tests {
 
     #[test]
     fn extended_mode_is_explicit() {
-        assert_eq!(
-            FeatureMode::parse("mode=extended\n"),
-            FeatureMode::Extended
-        );
+        assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::Extended);
     }
 }
