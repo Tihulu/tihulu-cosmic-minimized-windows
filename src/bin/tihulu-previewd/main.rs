@@ -203,51 +203,59 @@ impl Daemon {
             return self.status();
         }
 
-        let frame = match self.capture.capture_identifier(identifier) {
-            Ok(frame) => frame,
-            Err(error) => {
-                return Response::Error {
-                    version: PROTOCOL_VERSION,
-                    message: error,
-                };
-            }
-        };
-        let thumb = resize_fit(frame, TARGET_WIDTH, TARGET_HEIGHT);
-        if frame_is_effectively_blank(&thumb) {
-            if let Some(entry) = self.cache.get(key) {
-                return thumbnail_response(entry);
-            }
-            return Response::Error {
+        let response = match self.capture.capture_identifier(identifier) {
+            Err(error) => Response::Error {
                 version: PROTOCOL_VERSION,
-                message: "capture returned an effectively blank frame".to_owned(),
-            };
-        }
-        let entry = match self
-            .cache
-            .insert(key.to_owned(), thumb.width, thumb.height, &thumb.rgba)
-        {
-            Ok(entry) => entry,
-            Err(error) => {
-                self.degrade(error);
-                return self.status();
+                message: error,
+            },
+            Ok(frame) => {
+                let thumb = resize_fit(frame, TARGET_WIDTH, TARGET_HEIGHT);
+                if frame_is_effectively_blank(&thumb) {
+                    self.cache
+                        .get(key)
+                        .map(thumbnail_response)
+                        .unwrap_or_else(|| Response::Error {
+                            version: PROTOCOL_VERSION,
+                            message: "capture returned an effectively blank frame".to_owned(),
+                        })
+                } else {
+                    match self.cache.insert(
+                        key.to_owned(),
+                        thumb.width,
+                        thumb.height,
+                        &thumb.rgba,
+                    ) {
+                        Ok(entry) => thumbnail_response(entry),
+                        Err(error) => {
+                            self.degrade(error);
+                            self.status()
+                        }
+                    }
+                }
             }
         };
 
+        if self.state != PreviewState::Ready || !self.enforce_resource_budget() {
+            return self.status();
+        }
+        response
+    }
+
+    fn enforce_resource_budget(&mut self) -> bool {
         let daemon = process_metrics(std::process::id());
         let compositor = self.comp_pid.map(process_metrics);
         if let Some(reason) = self.growth.push(daemon, compositor) {
             self.degrade(reason.to_owned());
-            return self.status();
+            return false;
         }
         if daemon.rss_kb > self.rss_baseline_kb.saturating_add(RSS_BREAKER_KB) {
             self.degrade(format!(
                 "previewd RSS exceeded baseline by more than {} MiB",
                 RSS_BREAKER_KB / 1024
             ));
-            return self.status();
+            return false;
         }
-
-        thumbnail_response(entry)
+        true
     }
 
     fn cached_response(&mut self, key: &str) -> Response {
@@ -293,21 +301,14 @@ fn hash_key(key: &str) -> u64 {
 }
 
 fn frame_is_effectively_blank(frame: &CapturedFrame) -> bool {
-    let mut pixels = frame.rgba.chunks_exact(4);
-    let Some(first) = pixels.next() else {
-        return true;
-    };
-    if first[0] > BLANK_RGB_THRESHOLD
-        || first[1] > BLANK_RGB_THRESHOLD
-        || first[2] > BLANK_RGB_THRESHOLD
-    {
-        return false;
-    }
-    pixels.all(|pixel| {
-        pixel[0] <= BLANK_RGB_THRESHOLD
-            && pixel[1] <= BLANK_RGB_THRESHOLD
-            && pixel[2] <= BLANK_RGB_THRESHOLD
-    })
+    let (pixels, remainder) = frame.rgba.as_chunks::<4>();
+    !remainder.is_empty()
+        || pixels.is_empty()
+        || pixels.iter().all(|pixel| {
+            pixel[0] <= BLANK_RGB_THRESHOLD
+                && pixel[1] <= BLANK_RGB_THRESHOLD
+                && pixel[2] <= BLANK_RGB_THRESHOLD
+        })
 }
 
 fn resize_fit(frame: CapturedFrame, max_width: u32, max_height: u32) -> CapturedFrame {
