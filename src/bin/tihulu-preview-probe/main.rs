@@ -159,11 +159,11 @@ fn run() -> Result<ExitCode, String> {
                 comp.map(|metrics| metrics.capture_memfd_count).unwrap_or(0)
             );
 
-            if args.circuit_breaker {
-                if let Some(reason) = growth.push(probe, comp) {
-                    breaker_reason = Some(reason);
-                    break;
-                }
+            if args.circuit_breaker
+                && let Some(reason) = growth.push(probe, comp)
+            {
+                breaker_reason = Some(reason);
+                break;
             }
         }
 
