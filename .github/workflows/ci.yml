@@ -26,6 +26,8 @@ jobs:
           sudo apt-get install -y \
             cmake libegl1-mesa-dev libexpat1-dev libfontconfig-dev \
             libfreetype-dev libwayland-dev libxkbcommon-dev pkgconf
+      - name: Shell syntax
+        run: find scripts -maxdepth 1 -type f -name '*.sh' -print0 | xargs -0 -r bash -n
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Check
