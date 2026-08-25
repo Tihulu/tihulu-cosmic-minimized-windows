@@ -2,6 +2,26 @@
 
 This test is mandatory before the `feature/previewd` branch can be merged or promoted. CI is necessary but not sufficient; this procedure must be run in a real Pop!_OS/COSMIC Wayland session.
 
+## Guided runner
+
+The preferred path is the guided runtime runner. It samples previewd and compositor resources every two seconds, records a CSV and failure bundle, performs daemon stop/recovery and SIGKILL restart tests, checks cache/FD caps and monotonic FD/capture-memfd growth, and asks for explicit UI pass/fail confirmation at each phase.
+
+Install the exact candidate first, remove/re-add the applet in COSMIC Settings, then run:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/run-previewd-runtime-test.sh)
+```
+
+A successful first-stage run ends with `VERDICT: PASS CANDIDATE`. Logout/login coverage is still required before merge; after logging back in run:
+
+```bash
+MODE=post-login bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/run-previewd-runtime-test.sh)
+```
+
+The runner stores its CSV, manual check results, service status, journal and process snapshots under `~/tihulu-previewd-runtime-results/`. A runner `FAIL` means the branch must not be merged.
+
+The manual procedure below remains the reference for what each runner phase is validating.
+
 ## 1. Install the candidate
 
 ```bash
