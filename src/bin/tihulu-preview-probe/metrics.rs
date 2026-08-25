@@ -57,7 +57,8 @@ pub(crate) fn find_cosmic_comp() -> Option<u32> {
         .find(|pid| {
             let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok();
             let status = fs::read_to_string(format!("/proc/{pid}/status")).ok();
-            comm.as_deref().is_some_and(|name| name.trim() == "cosmic-comp")
+            comm.as_deref()
+                .is_some_and(|name| name.trim() == "cosmic-comp")
                 && status
                     .as_deref()
                     .and_then(status_uid)
