@@ -19,7 +19,26 @@ ext_image_copy_capture_manager_v1
 
 It does **not** use the retired cctk screencopy path from the old rich-preview implementation.
 
-## Build
+## One-command runtime self-test
+
+For the normal Brave gate, keep the intended Brave window minimized and run:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/542407d6d2eb8111b9ecdc508035ae7c21f98e62/scripts/run-preview-probe.sh)
+```
+
+The helper does not modify the current checkout. It clones the experimental branch into a temporary directory, builds the release probe, verifies a COSMIC Wayland session and `cosmic-comp`, lists toplevels, runs 500 captures against the first Brave match, writes the CSV under `~/tihulu-preview-probe-results/`, and prints an automatic `PASS`, `FAIL`, or `REVIEW` verdict.
+
+The helper cannot verify minimized state because `ext_foreign_toplevel_list_v1` does not expose it. The intended target must therefore remain minimized for the whole run. `PASS` is meaningful for the minimized-window gate only when that condition was satisfied.
+
+Optional overrides can be supplied as environment variables, for example:
+
+```bash
+MATCH_TERM='distinctive title' CAPTURES=500 SAMPLE_EVERY=10 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/542407d6d2eb8111b9ecdc508035ae7c21f98e62/scripts/run-preview-probe.sh)
+```
+
+## Build manually
 
 From the experimental branch:
 
@@ -28,7 +47,7 @@ git switch experiment/ext-image-copy-probe
 cargo build --release --bin tihulu-preview-probe
 ```
 
-## Select a target
+## Select a target manually
 
 The standard `ext_foreign_toplevel_list_v1` protocol exposes title/app-id/identifier but does not expose minimized state. Keep the window you want to probe minimized for the entire run.
 
@@ -96,7 +115,7 @@ The breaker is enabled by default. It stops the run with exit code `2` when any 
 
 The breaker is intentionally conservative. `--no-circuit-breaker` exists for controlled diagnosis but should not be the first test.
 
-RSS is recorded but is not used as an automatic breaker because allocator and compositor RSS can legitimately fluctuate. It still must be inspected for a persistent upward trend.
+RSS is recorded but is not used as an automatic hard fail because allocator and compositor RSS can legitimately fluctuate. The one-command helper returns `REVIEW` for a retained RSS increase of at least 32 MiB or for any sampled capture failure.
 
 ## Approval rule
 
