@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
