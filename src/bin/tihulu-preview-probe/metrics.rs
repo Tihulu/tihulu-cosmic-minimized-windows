@@ -100,10 +100,7 @@ impl GrowthWatch {
 
         if let Some(compositor) = compositor {
             push_window(&mut self.comp_fd, compositor.fd_count);
-            push_window(
-                &mut self.comp_capture_memfd,
-                compositor.capture_memfd_count,
-            );
+            push_window(&mut self.comp_capture_memfd, compositor.capture_memfd_count);
             if monotonic_growth(&self.comp_capture_memfd) {
                 return Some("cosmic-comp capture-related memfds are growing monotonically");
             }
