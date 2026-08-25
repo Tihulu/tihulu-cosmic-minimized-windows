@@ -55,6 +55,11 @@ async fn request(request: Request) -> Result<Response, String> {
 }
 
 async fn request_inner(request: Request) -> Result<Response, String> {
+    let version = request.version();
+    if version != PROTOCOL_VERSION {
+        return Err(format!("preview request protocol mismatch: {version}"));
+    }
+
     let socket = socket_path().ok_or_else(|| "XDG_RUNTIME_DIR is unavailable".to_owned())?;
     let mut stream = UnixStream::connect(socket)
         .await
