@@ -27,13 +27,13 @@ trap cleanup EXIT
 
 install_deps() {
   if ! need apt-get; then
-    warn "apt-get not found. Install the COSMIC/libcosmic build dependencies and pactl manually."
+    warn "apt-get not found. Install the COSMIC/libcosmic build dependencies manually."
     return
   fi
-  log "Installing build and media-control dependencies"
+  log "Installing build dependencies"
   sudo apt-get update
   sudo apt-get install -y \
-    build-essential cmake curl git pulseaudio-utils \
+    build-essential cmake curl git \
     libegl1-mesa-dev libexpat1-dev libfontconfig-dev libfreetype-dev \
     libwayland-dev libxkbcommon-dev pkgconf
 }
@@ -84,9 +84,16 @@ main() {
   sudo install -Dm0755 "target/release/$BIN" "$PREFIX/bin/$BIN"
   sudo install -Dm0644 "resources/$APP_ID.desktop" \
     "$PREFIX/share/applications/$APP_ID.desktop"
+  sudo install -Dm0644 "resources/icons/$APP_ID.svg" \
+    "$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID.svg"
+  sudo install -Dm0644 "resources/icons/$APP_ID-symbolic.svg" \
+    "$PREFIX/share/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg"
 
   if need update-desktop-database; then
     sudo update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
+  fi
+  if need gtk-update-icon-cache; then
+    sudo gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
   fi
 
   printf '\nTihulu Minimized Windows installed.\n'
