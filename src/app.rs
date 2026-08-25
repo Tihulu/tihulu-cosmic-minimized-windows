@@ -15,13 +15,18 @@ use cosmic::{
     widget::autosize::autosize,
 };
 
-use crate::wayland::{self, BridgeCommand, BridgeEvent, WindowDelta};
+use crate::{
+    config::{self, FeatureMode},
+    popup::{CloseGuard, OpenPlan, PopupFsm},
+    wayland::{self, BridgeCommand, BridgeEvent, WindowDelta},
+};
 
 const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
 const POPUP_WIDTH: f32 = 340.0;
 const POPUP_MAX_HEIGHT: f32 = 420.0;
 const ROW_HEIGHT_ESTIMATE: f32 = 52.0;
+const RICH_SUBSYSTEMS_AVAILABLE: bool = false;
 
 static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> =
     LazyLock::new(|| WidgetId::new("tihulu-minimized-windows-main"));
@@ -45,12 +50,8 @@ struct MinimizedWindows {
     desktop_entries: Vec<fde::DesktopEntry>,
     windows: Vec<Entry>,
     command_tx: Option<calloop::channel::Sender<BridgeCommand>>,
-    hover_group: Option<String>,
-    active_group: Option<String>,
-    close_epoch: u64,
-    popup_hovered: bool,
-    popup_pinned: bool,
-    group_popup: Option<WindowId>,
+    popup: PopupFsm,
+    feature_mode: FeatureMode,
 }
 
 #[derive(Clone, Debug)]
@@ -62,10 +63,11 @@ enum Message {
     GroupHoverExit(String),
     PopupEnter,
     PopupExit,
-    CloseDelayElapsed(u64),
+    CloseDelayElapsed(CloseGuard),
     Restore(ExtForeignToplevelHandleV1),
     CloseWindow(ExtForeignToplevelHandleV1),
     PopupClosed(WindowId),
+    ToggleSafeCore(bool),
 }
 
 impl MinimizedWindows {
@@ -248,11 +250,9 @@ impl MinimizedWindows {
         }
     }
 
-    fn create_popup(&mut self, group: &str) -> Task<Message> {
+    fn popup_task(&self, group: &str, id: WindowId) -> Task<Message> {
         use cosmic::iced::platform_specific::shell::commands::popup::get_popup;
 
-        let id = WindowId::unique();
-        self.group_popup = Some(id);
         let mut settings = self.core.applet.get_popup_settings(
             self.core.main_window_id().unwrap(),
             id,
@@ -265,51 +265,46 @@ impl MinimizedWindows {
     }
 
     fn open_group(&mut self, group: String, pinned: bool) -> Task<Message> {
+        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
+
         if self.group_count(&group) == 0 {
             return cosmic::task::none();
         }
 
-        self.close_epoch = self.close_epoch.wrapping_add(1);
-        self.active_group = Some(group.clone());
-        self.popup_hovered = false;
-        if pinned {
-            self.popup_pinned = true;
-        } else if self.group_popup.is_none() {
-            self.popup_pinned = false;
-        }
-
-        // Stability-first rule: while a popup surface exists, reuse it and only replace
-        // its contents. Avoiding destroy/recreate/reposition churn makes hover independent
-        // of compositor popup-lifetime races.
-        if self.group_popup.is_some() {
-            cosmic::task::none()
-        } else {
-            self.create_popup(&group)
+        let proposed_id = WindowId::unique();
+        match self.popup.request_open(group, pinned, proposed_id) {
+            OpenPlan::None => cosmic::task::none(),
+            OpenPlan::Create { window_id, group } => self.popup_task(&group, window_id),
+            OpenPlan::Replace {
+                old_window_id,
+                window_id,
+                group,
+            } => Task::batch([
+                destroy_popup(old_window_id),
+                self.popup_task(&group, window_id),
+            ]),
         }
     }
 
     fn close_popup(&mut self) -> Task<Message> {
         use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
 
-        self.active_group = None;
-        self.hover_group = None;
-        self.popup_hovered = false;
-        self.popup_pinned = false;
-        let Some(id) = self.group_popup.take() else {
-            return cosmic::task::none();
-        };
-        destroy_popup(id)
+        self.popup
+            .close_current()
+            .map(destroy_popup)
+            .unwrap_or_else(cosmic::task::none)
     }
 
     fn schedule_close(&mut self) -> Task<Message> {
-        self.close_epoch = self.close_epoch.wrapping_add(1);
-        let epoch = self.close_epoch;
+        let Some(guard) = self.popup.schedule_close() else {
+            return cosmic::task::none();
+        };
         Task::perform(
             async move {
                 tokio::time::sleep(LEAVE_GRACE).await;
-                epoch
+                guard
             },
-            |epoch| cosmic::Action::App(Message::CloseDelayElapsed(epoch)),
+            |guard| cosmic::Action::App(Message::CloseDelayElapsed(guard)),
         )
     }
 
@@ -336,8 +331,12 @@ impl MinimizedWindows {
             .into()
     }
 
+    fn effective_safe_core(&self) -> bool {
+        self.feature_mode.safe_core() || !RICH_SUBSYSTEMS_AVAILABLE
+    }
+
     fn group_popup_view(&self) -> cosmic::Element<'_, Message> {
-        let Some(group) = self.active_group.as_deref() else {
+        let Some(group) = self.popup.active_group() else {
             return cosmic::widget::space::horizontal().into();
         };
         let entries = self
@@ -374,9 +373,26 @@ impl MinimizedWindows {
             list.into()
         };
 
-        let content = cosmic::widget::column::with_children(vec![header.into(), list])
-            .spacing(9.0)
-            .width(Length::Fixed(POPUP_WIDTH));
+        let safe_core_toggle = cosmic::widget::toggler(self.feature_mode.safe_core())
+            .label("Safe Core mode")
+            .on_toggle(Message::ToggleSafeCore)
+            .width(Length::Fill);
+        let mode_note = if self.feature_mode.safe_core() {
+            "Rich preview/media subsystems are disabled."
+        } else if self.effective_safe_core() {
+            "Extended mode requested; Safe Core remains active until optional daemons are available and healthy."
+        } else {
+            "Extended mode enabled. Any subsystem failure falls back to Safe Core."
+        };
+
+        let content = cosmic::widget::column::with_children(vec![
+            header.into(),
+            list,
+            safe_core_toggle.into(),
+            cosmic::widget::text(mode_note).into(),
+        ])
+        .spacing(9.0)
+        .width(Length::Fixed(POPUP_WIDTH));
 
         cosmic::widget::mouse_area(content)
             .on_enter(Message::PopupEnter)
@@ -396,6 +412,7 @@ impl cosmic::Application for MinimizedWindows {
         let mut app = Self {
             core,
             language: fde::get_languages_from_env(),
+            feature_mode: config::load_feature_mode(),
             ..Default::default()
         };
         app.reload_desktop_entries();
@@ -441,8 +458,7 @@ impl cosmic::Application for MinimizedWindows {
                     WindowDelta::Gone(handle) => {
                         let removed_group = self.remove(&handle);
                         let active_disappeared = removed_group.as_deref().is_some_and(|group| {
-                            self.active_group.as_deref() == Some(group)
-                                && self.group_count(group) == 0
+                            self.popup.active_group() == Some(group) && self.group_count(group) == 0
                         });
                         let close = if active_disappeared {
                             self.close_popup()
@@ -479,36 +495,26 @@ impl cosmic::Application for MinimizedWindows {
                 }
             }
             Message::GroupHoverEnter(group) => {
-                self.close_epoch = self.close_epoch.wrapping_add(1);
-                self.hover_group = Some(group.clone());
-                if !self.popup_pinned {
+                self.popup.group_enter(group.clone());
+                if !self.popup.is_pinned() {
                     return self.open_group(group, false);
                 }
             }
             Message::GroupHoverExit(group) => {
-                if self.hover_group.as_deref() == Some(group.as_str()) {
-                    self.hover_group = None;
-                }
-                if self.group_popup.is_some() && !self.popup_pinned {
+                self.popup.group_exit(&group);
+                if self.popup.is_open() && !self.popup.is_pinned() {
                     return self.schedule_close();
                 }
             }
-            Message::PopupEnter => {
-                self.popup_hovered = true;
-                self.close_epoch = self.close_epoch.wrapping_add(1);
-            }
+            Message::PopupEnter => self.popup.popup_enter(),
             Message::PopupExit => {
-                self.popup_hovered = false;
-                if !self.popup_pinned {
+                self.popup.popup_exit();
+                if !self.popup.is_pinned() {
                     return self.schedule_close();
                 }
             }
-            Message::CloseDelayElapsed(epoch) => {
-                if self.close_epoch == epoch
-                    && !self.popup_pinned
-                    && self.hover_group.is_none()
-                    && !self.popup_hovered
-                {
+            Message::CloseDelayElapsed(guard) => {
+                if self.popup.should_close(guard) {
                     return self.close_popup();
                 }
             }
@@ -524,12 +530,16 @@ impl cosmic::Application for MinimizedWindows {
                 }
             }
             Message::PopupClosed(id) => {
-                if self.group_popup == Some(id) {
-                    self.group_popup = None;
-                    self.active_group = None;
-                    self.hover_group = None;
-                    self.popup_hovered = false;
-                    self.popup_pinned = false;
+                let _ = self.popup.compositor_closed(id);
+            }
+            Message::ToggleSafeCore(enabled) => {
+                self.feature_mode = if enabled {
+                    FeatureMode::SafeCore
+                } else {
+                    FeatureMode::Extended
+                };
+                if let Err(error) = config::save_feature_mode(self.feature_mode) {
+                    tracing::warn!(?error, "Could not persist Safe Core setting");
                 }
             }
         }
@@ -568,7 +578,7 @@ impl cosmic::Application for MinimizedWindows {
     }
 
     fn view_window(&self, id: WindowId) -> cosmic::Element<'_, Self::Message> {
-        if self.group_popup == Some(id) {
+        if self.popup.window_id() == Some(id) {
             self.core
                 .applet
                 .popup_container(self.group_popup_view())
