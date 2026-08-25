@@ -50,6 +50,7 @@ pub(crate) async fn capture(key: String, identifier: String) -> Result<PreviewPa
         } => soft_window_failure(
             reason.unwrap_or_else(|| "preview is not ready for this window".to_owned()),
         )
+        .await,
         response => payload_from_response(response).await,
     }
 }
@@ -244,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn soft_unavailable_key_cannot_match_real_identifier() {
+    fn soft_unavailable_key_is_namespaced() {
         assert!(SOFT_UNAVAILABLE_KEY.starts_with("__tihulu_preview_"));
     }
 }
