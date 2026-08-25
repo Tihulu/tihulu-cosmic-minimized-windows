@@ -39,8 +39,6 @@ use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 struct ToplevelInfo {
     handle: ExtForeignToplevelHandleV1,
     identifier: Option<String>,
-    title: Option<String>,
-    app_id: Option<String>,
     closed: bool,
 }
 
@@ -141,7 +139,10 @@ impl CaptureWayland {
         Ok(())
     }
 
-    fn capture_source(&mut self, source: &ExtImageCaptureSourceV1) -> Result<CapturedFrame, String> {
+    fn capture_source(
+        &mut self,
+        source: &ExtImageCaptureSourceV1,
+    ) -> Result<CapturedFrame, String> {
         let copy_mgr = self
             .state
             .copy_mgr
@@ -156,7 +157,8 @@ impl CaptureWayland {
         self.state.capture = CaptureState::default();
 
         let session = copy_mgr.create_session(source, Options::empty(), &qh, ());
-        let constraints = self.roundtrip_until(|capture| capture.constraints_done || capture.failed);
+        let constraints =
+            self.roundtrip_until(|capture| capture.constraints_done || capture.failed);
         if !constraints || self.state.capture.failed {
             let reason = self
                 .state
@@ -225,11 +227,14 @@ impl CaptureWayland {
             return Err(reason);
         }
 
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| format!("capture seek failed: {error}"))?;
-        let mut raw = vec![0_u8; size];
-        file.read_exact(&mut raw)
-            .map_err(|error| format!("capture read failed: {error}"))?;
+        let raw_result = (|| -> Result<Vec<u8>, String> {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| format!("capture seek failed: {error}"))?;
+            let mut raw = vec![0_u8; size];
+            file.read_exact(&mut raw)
+                .map_err(|error| format!("capture read failed: {error}"))?;
+            Ok(raw)
+        })();
 
         frame.destroy();
         buffer.destroy();
@@ -237,6 +242,7 @@ impl CaptureWayland {
         session.destroy();
         let _ = self.queue.roundtrip(&mut self.state);
 
+        let raw = raw_result?;
         let rgba = Self::to_rgba(&raw, layout);
         Ok(CapturedFrame {
             width,
@@ -397,8 +403,6 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for State {
                 ToplevelInfo {
                     handle: toplevel,
                     identifier: None,
-                    title: None,
-                    app_id: None,
                     closed: false,
                 },
             );
@@ -426,8 +430,6 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
             ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => {
                 info.identifier = Some(identifier);
             }
-            ext_foreign_toplevel_handle_v1::Event::Title { title } => info.title = Some(title),
-            ext_foreign_toplevel_handle_v1::Event::AppId { app_id } => info.app_id = Some(app_id),
             ext_foreign_toplevel_handle_v1::Event::Closed => info.closed = true,
             _ => {}
         }
