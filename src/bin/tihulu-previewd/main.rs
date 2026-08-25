@@ -316,8 +316,7 @@ fn resize_fit(frame: CapturedFrame, max_width: u32, max_height: u32) -> Captured
         for x in 0..target_width {
             let source_x = u64::from(x) * u64::from(frame.width) / u64::from(target_width);
             let source = ((source_y * u64::from(frame.width) + source_x) * 4) as usize;
-            let target =
-                ((u64::from(y) * u64::from(target_width) + u64::from(x)) * 4) as usize;
+            let target = ((u64::from(y) * u64::from(target_width) + u64::from(x)) * 4) as usize;
             rgba[target..target + 4].copy_from_slice(&frame.rgba[source..source + 4]);
         }
     }
