@@ -2,76 +2,66 @@
 
 A stability-first minimized-window applet for the COSMIC desktop, licensed **AGPL-3.0-only**.
 
-The project keeps window management in a small Safe Core and treats previews/media as optional external subsystems. This is intentional: historical minimize-preview paths could leak compositor-side screenshot resources, so rich features are not allowed to make the panel applet unstable.
+The project exists because minimized-window preview paths can be dangerous when compositor-side screenshot resources leak. The applet therefore treats window management as the always-available core and makes rich features optional and isolated.
 
 ## v0.4 Safe Core
 
-The Safe Core provides:
+The always-available core provides:
 
 - minimized-toplevel tracking on Wayland
 - grouping by application, including browser aliases
 - one dock/panel icon per group with a window count
-- exact-window restore and close
+- exact-window restore
+- exact-window close
 - lightweight icon/title group popup
 - immediate hover with a 650 ms icon-to-popup leave grace
 - click/right-click pinning for multi-window groups
 - horizontal and vertical COSMIC panel/dock support
-- an explicit persisted Safe Core/Extended preference
+- a persisted **Safe Core mode** switch
 
-Safe Core performs no screenshot capture, owns no preview memfds, and does not depend on preview/media daemons for grouping, restore, or close.
+Safe Core itself owns no screenshot buffers, preview memfds, album art, MPRIS or audio-control work.
 
-The setting is stored under the user's XDG config directory as:
+## Experimental external previews
+
+The `feature/previewd` branch contains the runtime-test candidate for external window previews.
 
 ```text
-~/.config/tihulu-cosmic-minimized-windows/config
+tihulu-cosmic-minimized-windows
+    lightweight panel UI
+    Safe Core always works
+            |
+            +-- optional IPC --> tihulu-previewd
+            |
+            +-- future IPC ---> tihulu-mediad
 ```
 
-## Preview daemon runtime candidate
+`tihulu-previewd` is a per-user process. The panel applet never performs Wayland image capture itself. The daemon uses `ext-image-copy-capture` with a foreign-toplevel image capture source and exact foreign-toplevel identifiers.
 
-The `feature/previewd` branch contains the first external `tihulu-previewd` runtime candidate.
+The capture path was gated first by a real 500-capture Pop!_OS/COSMIC probe. That run completed 500/500 captures with bounded resources: probe FD 11 -> 11, cosmic-comp FD 374 -> 370 with bounded oscillation, cosmic-comp memfd 69 -> 69, capture-related compositor memfd 0 -> 0, and unchanged compositor RSS/shmem.
 
-The panel applet does **not** perform Wayland image capture itself. Capture is isolated in the per-user daemon and uses `ext-image-copy-capture` plus the foreign-toplevel image capture source. The applet communicates with the daemon over a versioned Unix socket under `XDG_RUNTIME_DIR`.
+The preview candidate additionally enforces:
 
-The isolated COSMIC probe passed the integration gate before this branch was created:
-
-- 500/500 captures succeeded
-- probe FD: `11 -> 11`
-- `cosmic-comp` FD: `374 -> 370`, bounded with maximum 374
-- `cosmic-comp` memfd: `69 -> 69`
-- `cosmic-comp` capture-related memfd: `0 -> 0`
-- compositor RSS/shared-memory measurements remained bounded
-
-That probe result permits runtime testing of the daemon architecture; it does **not** by itself approve a stable release.
-
-### Preview safety invariants
-
-The current candidate enforces:
-
-- one capture request in flight through the applet capture gate
-- serial capture processing in `tihulu-previewd`
-- capture on minimize / Extended-mode recovery, never continuously on hover
-- hover reads only the bounded preview cache already held by the applet
-- 320x180 thumbnail target
-- maximum 16 cached daemon thumbnails
-- maximum 8 MiB daemon thumbnail cache
-- LRU eviction
+- one capture in flight globally
+- 64 MiB hard limit for a full-size capture before allocation
+- in-place raw-to-RGBA conversion
+- full-size buffer discarded after thumbnail generation
+- approximately 320x180 thumbnail target
+- maximum 16 daemon thumbnails
+- maximum 8 MiB daemon thumbnail cache with LRU eviction
 - maximum 16 applet preview handles
-- 64 MiB hard limit for a full-size capture buffer before allocation
-- in-place raw-to-RGBA conversion to avoid a second full-size image allocation
-- immediate destruction of Wayland frame/buffer/pool/session objects after capture
 - daemon/compositor FD and capture-memfd growth watchdog
-- 128 MiB daemon RSS growth circuit breaker
-- degraded daemon state clears preview cache and stops further capture
-- 15-second health checks in Extended mode
-- automatic Safe Core fallback if the daemon is unavailable or degraded
-- automatic re-capture/recovery when the daemon becomes healthy again
+- +128 MiB daemon RSS circuit breaker
+- automatic Safe Core fallback when previewd is unavailable or degraded
+- 15-second health/recovery polling
 - systemd user service with `LimitNOFILE=256`, `NoNewPrivileges=true`, and `UMask=0077`
 
-If previewd fails, grouping, restore, close, titles and icons remain available through Safe Core.
+Hover reads cached previews only; hover does not request a new capture.
+
+Media/MPRIS/PipeWire support is intentionally not part of the preview candidate.
 
 ## Popup lifetime safety
 
-Popup lifetime is controlled by an explicit FSM:
+The popup uses an explicit state machine:
 
 ```text
 Closed
@@ -79,11 +69,9 @@ HoverOpen(group, window_id, generation)
 Pinned(group, window_id, generation)
 ```
 
-Delayed close requests carry both a popup generation and close token. Stale timers cannot close a newer popup, and stale compositor-close events for an old `WindowId` are ignored. Switching to a different application group deliberately replaces/reanchors the popup surface.
+Delayed close requests carry both the popup generation and a close token. A stale timer cannot close a newer popup. A compositor close event for an old `WindowId` is ignored after a newer popup generation has replaced it.
 
-## Media status
-
-Media controls are **not** part of this preview candidate. `tihulu-mediad`/MPRIS/PipeWire work remains a later stage and will not be added until previewd passes the full real-runtime acceptance test.
+When hover changes to a different application group, the old popup surface is replaced so the new surface receives the correct anchor rectangle. Hovering/pinning the same group reuses the current surface.
 
 ## Install
 
@@ -93,52 +81,45 @@ Stable installer:
 curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/stable/scripts/quick-install.sh | bash
 ```
 
-Previewd runtime candidate:
+Current Safe Core RC:
+
+```bash
+REF=v0.4-safe-core bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/v0.4-safe-core/scripts/quick-install.sh)
+```
+
+Experimental previewd candidate:
 
 ```bash
 REF=feature/previewd bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/quick-install.sh)
 ```
 
-The candidate installer builds and installs both `tihulu-cosmic-minimized-windows` and `tihulu-previewd`, installs the systemd user unit, reloads user units, and attempts to enable/start `tihulu-previewd.service`.
+Then open **COSMIC Settings → Desktop → Dock/Panel**, remove the existing applet instance and add **Tihulu Minimized Windows** again.
 
-Then open **COSMIC Settings -> Desktop -> Dock/Panel**, remove the previous applet instance, and add **Tihulu Minimized Windows** again.
+## Previewd runtime acceptance
 
-Check the daemon with:
+CI proves formatting/build/test/lint correctness, not COSMIC runtime lifetime safety. The preview branch must pass the real-session acceptance test before it can be merged or promoted.
 
-```bash
-systemctl --user is-active tihulu-previewd.service
-systemctl --user status tihulu-previewd.service --no-pager
-```
-
-## Using previews
-
-Safe Core is the default. Minimize at least two windows from an application, open the group popup, then turn **Safe Core mode** off. This requests Extended mode.
-
-When previewd is healthy, the popup note changes to:
-
-```text
-Window previews are provided by tihulu-previewd. Media controls are not enabled yet.
-```
-
-Existing minimized windows are captured sequentially when Extended mode is enabled. Newly minimized windows are captured once when they enter the minimized set. Repeated hover does not request fresh captures.
-
-If previewd becomes unavailable/degraded, the popup falls back to title/icon rows and reports that Safe Core fallback is active.
-
-## Runtime acceptance
-
-CI proves build/test/lint correctness, not COSMIC runtime safety. The preview branch must pass a second real Pop!_OS/COSMIC acceptance run before merge or promotion.
-
-Use the resource watcher while testing:
+Preferred guided runner:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/watch-previewd-resources.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/run-previewd-runtime-test.sh)
 ```
 
-It reports applet, previewd, `cosmic-panel`, and `cosmic-comp` FD/RSS/shared-memory/memfd counts plus the preview cache size.
+It samples previewd/compositor resources, performs the fallback/recovery and restart-on-failure checks, records a CSV/failure bundle, checks cache and FD limits plus monotonic FD/capture-memfd growth, and asks for explicit UI pass/fail confirmation at each phase.
 
-The required functional/resource test is documented in [`docs/PREVIEWD_RUNTIME_ACCEPTANCE.md`](docs/PREVIEWD_RUNTIME_ACCEPTANCE.md).
+A successful first run ends with `VERDICT: PASS CANDIDATE`. Logout/login is then verified with:
 
-A bounded pattern such as `92 -> 93 -> 92 -> 93` is acceptable. Monotonic FD/capture-memfd growth such as `92 -> 93 -> 94 -> 95` is a failure. Do not merge the preview branch if the compositor or daemon shows monotonic resource growth, if fallback fails, or if hover causes repeated capture.
+```bash
+MODE=post-login bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/feature/previewd/scripts/run-previewd-runtime-test.sh)
+```
+
+Full manual/reference procedure: `docs/PREVIEWD_RUNTIME_ACCEPTANCE.md`.
+
+Runtime acceptance includes Brave with 2/3/4/5 minimized windows, 100+ hover cycles, restore/close churn, daemon stop/recovery, restart-on-failure, two monitors when available, logout/login, and FD/RSS/shmem/memfd observation.
+
+A bounded sequence such as `92 -> 93 -> 92 -> 93` is acceptable. Monotonic growth such as `92 -> 93 -> 94 -> 95` is a failure.
+
+PR #12 remains draft until this real runtime acceptance passes.
 
 ## Development
 
@@ -152,7 +133,7 @@ cargo build --release
 
 The repository pins the COSMIC client-toolkit revision used by the pinned `libcosmic` revision to avoid duplicate/incompatible Wayland protocol types.
 
-Experimental rich-feature work stays on separate branches/PRs. Runtime-untested rich features are not merged into stable.
+Experimental preview/media work belongs on separate branches and PRs. Runtime-untested rich features must not be merged into stable.
 
 ## License
 
