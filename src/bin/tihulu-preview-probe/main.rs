@@ -127,14 +127,7 @@ fn run() -> Result<ExitCode, String> {
     let baseline_probe = process_metrics(std::process::id());
     let baseline_comp = comp_pid.map(process_metrics);
     samples
-        .record(
-            "baseline",
-            0,
-            None,
-            baseline_probe,
-            comp_pid,
-            baseline_comp,
-        )
+        .record("baseline", 0, None, baseline_probe, comp_pid, baseline_comp)
         .map_err(|error| format!("could not write baseline sample: {error}"))?;
     let _ = growth.push(baseline_probe, baseline_comp);
 
@@ -152,8 +145,7 @@ fn run() -> Result<ExitCode, String> {
             }
         }
 
-        let should_sample =
-            iteration % args.sample_every == 0 || iteration == args.captures || !ok;
+        let should_sample = iteration % args.sample_every == 0 || iteration == args.captures || !ok;
         if should_sample {
             let probe = process_metrics(std::process::id());
             let comp = comp_pid.map(process_metrics);
