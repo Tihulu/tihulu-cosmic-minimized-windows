@@ -46,11 +46,7 @@ pub(crate) async fn capture_many(
     for (key, identifier) in requests {
         let response_key = key.clone();
         let result = capture(key, identifier).await;
-        let failed = result.is_err();
         results.push((response_key, result));
-        if failed {
-            break;
-        }
     }
     results
 }
