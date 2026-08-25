@@ -267,6 +267,8 @@ impl ProbeWayland {
 
         const XR24: u32 = 0x3432_5258;
         const AR24: u32 = 0x3432_5241;
+        const XB24: u32 = 0x3432_4258;
+        const AB24: u32 = 0x3432_4241;
         let has_format = |wl: wl_shm::Format, drm: u32| {
             let wl = u32::from(wl);
             capture
@@ -278,9 +280,13 @@ impl ProbeWayland {
             wl_shm::Format::Xrgb8888
         } else if has_format(wl_shm::Format::Argb8888, AR24) {
             wl_shm::Format::Argb8888
+        } else if has_format(wl_shm::Format::Xbgr8888, XB24) {
+            wl_shm::Format::Xbgr8888
+        } else if has_format(wl_shm::Format::Abgr8888, AB24) {
+            wl_shm::Format::Abgr8888
         } else {
             return Err(format!(
-                "no supported XRGB/ARGB shm format; advertised={:?}",
+                "no supported 32-bit RGB shm format; advertised={:?}",
                 capture.formats
             ));
         };
@@ -481,3 +487,34 @@ ignore_events!(
     ExtImageCopyCaptureManagerV1,
     ExtForeignToplevelImageCaptureSourceManagerV1,
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_cosmic_xbgr8888_capture_format() {
+        let capture = CaptureState {
+            size: Some((1920, 1080)),
+            formats: vec![0x3432_4258],
+            ..CaptureState::default()
+        };
+
+        let (_, _, stride, size, _, format) = ProbeWayland::capture_layout(&capture).unwrap();
+        assert_eq!(u32::from(format), u32::from(wl_shm::Format::Xbgr8888));
+        assert_eq!(stride, 1920 * 4);
+        assert_eq!(size, 1920 * 1080 * 4);
+    }
+
+    #[test]
+    fn accepts_cosmic_abgr8888_capture_format() {
+        let capture = CaptureState {
+            size: Some((320, 180)),
+            formats: vec![0x3432_4241],
+            ..CaptureState::default()
+        };
+
+        let (_, _, _, _, _, format) = ProbeWayland::capture_layout(&capture).unwrap();
+        assert_eq!(u32::from(format), u32::from(wl_shm::Format::Abgr8888));
+    }
+}
