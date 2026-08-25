@@ -9,8 +9,11 @@ use std::{
     collections::HashMap,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, Read, Write},
-    os::unix::{fs::PermissionsExt, net::{UnixListener, UnixStream}},
+    io::{BufRead, BufReader, Write},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -63,12 +66,23 @@ impl PreviewCache {
         })
     }
 
-    fn insert(&mut self, key: String, width: u32, height: u32, rgba: &[u8]) -> Result<CacheEntry, String> {
+    fn insert(
+        &mut self,
+        key: String,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<CacheEntry, String> {
         if rgba.len() > MAX_CACHE_BYTES {
-            return Err(format!("thumbnail is too large for cache budget: {} bytes", rgba.len()));
+            return Err(format!(
+                "thumbnail is too large for cache budget: {} bytes",
+                rgba.len()
+            ));
         }
         self.remove(&key);
-        while self.entries.len() >= MAX_THUMBNAILS || self.bytes.saturating_add(rgba.len()) > MAX_CACHE_BYTES {
+        while self.entries.len() >= MAX_THUMBNAILS
+            || self.bytes.saturating_add(rgba.len()) > MAX_CACHE_BYTES
+        {
             let Some(oldest) = self
                 .entries
                 .values()
@@ -85,7 +99,8 @@ impl PreviewCache {
         let path = self.dir.join(format!("{:016x}.rgba", hash_key(&key)));
         let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(&temporary, rgba).map_err(|error| format!("thumbnail write failed: {error}"))?;
-        fs::rename(&temporary, &path).map_err(|error| format!("thumbnail publish failed: {error}"))?;
+        fs::rename(&temporary, &path)
+            .map_err(|error| format!("thumbnail publish failed: {error}"))?;
         let entry = CacheEntry {
             key: key.clone(),
             generation: self.generation,
@@ -135,7 +150,8 @@ struct Daemon {
 impl Daemon {
     fn new(cache_dir: PathBuf) -> Result<Self, String> {
         let capture = CaptureWayland::connect()?;
-        let cache = PreviewCache::new(cache_dir).map_err(|error| format!("cache init failed: {error}"))?;
+        let cache =
+            PreviewCache::new(cache_dir).map_err(|error| format!("cache init failed: {error}"))?;
         let comp_pid = find_cosmic_comp();
         let rss_baseline_kb = process_metrics(std::process::id()).rss_kb;
         Ok(Self {
@@ -275,11 +291,19 @@ fn resize_fit(frame: CapturedFrame, max_width: u32, max_height: u32) -> Captured
     let (target_width, target_height) = if frame.width <= max_width && frame.height <= max_height {
         (frame.width, frame.height)
     } else if width_limited {
-        let height = (u64::from(frame.height) * u64::from(max_width) / u64::from(frame.width)).max(1);
-        (max_width, u32::try_from(height).unwrap_or(max_height).min(max_height))
+        let height =
+            (u64::from(frame.height) * u64::from(max_width) / u64::from(frame.width)).max(1);
+        (
+            max_width,
+            u32::try_from(height).unwrap_or(max_height).min(max_height),
+        )
     } else {
-        let width = (u64::from(frame.width) * u64::from(max_height) / u64::from(frame.height)).max(1);
-        (u32::try_from(width).unwrap_or(max_width).min(max_width), max_height)
+        let width =
+            (u64::from(frame.width) * u64::from(max_height) / u64::from(frame.height)).max(1);
+        (
+            u32::try_from(width).unwrap_or(max_width).min(max_width),
+            max_height,
+        )
     };
 
     if target_width == frame.width && target_height == frame.height {
@@ -292,7 +316,8 @@ fn resize_fit(frame: CapturedFrame, max_width: u32, max_height: u32) -> Captured
         for x in 0..target_width {
             let source_x = u64::from(x) * u64::from(frame.width) / u64::from(target_width);
             let source = ((source_y * u64::from(frame.width) + source_x) * 4) as usize;
-            let target = ((u64::from(y) * u64::from(target_width) + u64::from(x)) * 4) as usize;
+            let target =
+                ((u64::from(y) * u64::from(target_width) + u64::from(x)) * 4) as usize;
             rgba[target..target + 4].copy_from_slice(&frame.rgba[source..source + 4]);
         }
     }
@@ -311,20 +336,25 @@ fn read_request(stream: &UnixStream) -> Result<Request, String> {
         .try_clone()
         .map_err(|error| format!("socket clone failed: {error}"))?;
     let mut reader = BufReader::new(clone).take(MAX_REQUEST_BYTES);
-    let mut data = String::new();
+    let mut line = String::new();
     reader
-        .read_to_string(&mut data)
+        .read_line(&mut line)
         .map_err(|error| format!("socket read failed: {error}"))?;
-    let line = data.lines().next().ok_or_else(|| "empty request".to_owned())?;
-    serde_json::from_str(line).map_err(|error| format!("invalid request: {error}"))
+    if line.is_empty() {
+        return Err("empty request".to_owned());
+    }
+    if !line.ends_with('\n') {
+        return Err("request exceeded frame limit or lacked newline terminator".to_owned());
+    }
+    serde_json::from_str(line.trim_end()).map_err(|error| format!("invalid request: {error}"))
 }
 
 fn write_response(mut stream: &UnixStream, response: &Response) -> Result<(), String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| format!("set write timeout failed: {error}"))?;
-    let mut encoded = serde_json::to_vec(response)
-        .map_err(|error| format!("response encode failed: {error}"))?;
+    let mut encoded =
+        serde_json::to_vec(response).map_err(|error| format!("response encode failed: {error}"))?;
     encoded.push(b'\n');
     stream
         .write_all(&encoded)
@@ -333,14 +363,16 @@ fn write_response(mut stream: &UnixStream, response: &Response) -> Result<(), St
 
 fn prepare_socket(path: &Path) -> Result<UnixListener, String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("runtime dir create failed: {error}"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("runtime dir create failed: {error}"))?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("runtime dir permissions failed: {error}"))?;
     }
     if path.exists() {
         fs::remove_file(path).map_err(|error| format!("stale socket removal failed: {error}"))?;
     }
-    let listener = UnixListener::bind(path).map_err(|error| format!("socket bind failed: {error}"))?;
+    let listener =
+        UnixListener::bind(path).map_err(|error| format!("socket bind failed: {error}"))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("socket permissions failed: {error}"))?;
     Ok(listener)
