@@ -374,7 +374,7 @@ impl MinimizedWindows {
         };
 
         let safe_core_toggle = cosmic::widget::toggler(self.feature_mode.safe_core())
-            .label("Safe Core mode")
+            .label(Some("Safe Core mode".to_owned()))
             .on_toggle(Message::ToggleSafeCore)
             .width(Length::Fill);
         let mode_note = if self.feature_mode.safe_core() {
