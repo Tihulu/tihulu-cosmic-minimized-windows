@@ -219,12 +219,10 @@ impl Daemon {
                             message: "capture returned an effectively blank frame".to_owned(),
                         })
                 } else {
-                    match self.cache.insert(
-                        key.to_owned(),
-                        thumb.width,
-                        thumb.height,
-                        &thumb.rgba,
-                    ) {
+                    match self
+                        .cache
+                        .insert(key.to_owned(), thumb.width, thumb.height, &thumb.rgba)
+                    {
                         Ok(entry) => thumbnail_response(entry),
                         Err(error) => {
                             self.degrade(error);
