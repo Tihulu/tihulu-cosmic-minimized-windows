@@ -45,7 +45,7 @@ pub(crate) async fn seek(
     bus_name: String,
     track_id: String,
     position_micros: i64,
-) -> Result<(), String> {
+) -> Result<Option<MediaPlayerState>, String> {
     match request(MediaRequest::Seek {
         version: MEDIA_PROTOCOL_VERSION,
         bus_name,
@@ -54,7 +54,7 @@ pub(crate) async fn seek(
     })
     .await?
     {
-        MediaResponse::State { version, .. } if version == MEDIA_PROTOCOL_VERSION => Ok(()),
+        MediaResponse::State { version, player } if version == MEDIA_PROTOCOL_VERSION => Ok(player),
         MediaResponse::State { version, .. } => Err(format!("media protocol mismatch: {version}")),
         MediaResponse::Error { message, .. } => Err(message),
     }
