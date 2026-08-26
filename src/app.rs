@@ -212,7 +212,8 @@ impl MinimizedWindows {
         .padding([py as f32, px as f32])
         .on_press_down(Message::GroupPrimary(group.clone()));
 
-        let area = cosmic::widget::mouse_area(button).on_right_press(Message::GroupOpen(group.clone()));
+        let area =
+            cosmic::widget::mouse_area(button).on_right_press(Message::GroupOpen(group.clone()));
         if self.settings.hover_popups {
             area.on_enter(Message::GroupHoverEnter(group.clone()))
                 .on_exit(Message::GroupHoverExit(group))
