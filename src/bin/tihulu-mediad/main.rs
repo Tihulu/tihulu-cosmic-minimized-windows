@@ -150,7 +150,11 @@ fn trim_artwork_cache(dir: &Path) {
         .filter_map(|entry| {
             let path = entry.path();
             let metadata = entry.metadata().ok()?;
-            if !metadata.is_file() || path.extension().is_some_and(|extension| extension == "part") {
+            if !metadata.is_file()
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "part")
+            {
                 return None;
             }
             Some((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), path))
@@ -248,7 +252,10 @@ async fn cache_artwork(url: &str) -> Option<String> {
     Some(final_path.to_string_lossy().into_owned())
 }
 
-async fn read_player_raw(connection: &Connection, bus_name: &str) -> Result<RawPlayerState, String> {
+async fn read_player_raw(
+    connection: &Connection,
+    bus_name: &str,
+) -> Result<RawPlayerState, String> {
     let root = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_ROOT)
         .await
         .map_err(|error| format!("MPRIS root proxy failed: {error}"))?;
@@ -372,12 +379,7 @@ async fn find_player(
             }
             continue;
         }
-        if fallback.is_none()
-            && raw
-                .player
-                .playback_status
-                .eq_ignore_ascii_case("Playing")
-        {
+        if fallback.is_none() && raw.player.playback_status.eq_ignore_ascii_case("Playing") {
             fallback = Some(raw);
         }
     }
