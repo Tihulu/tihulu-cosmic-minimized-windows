@@ -666,7 +666,7 @@ impl MinimizedWindows {
                             fraction,
                         }
                     })
-                    .step(0.001)
+                    .step(0.001_f32)
                     .on_release(Message::MediaSeekCommit(group.to_owned()))
                     .width(Length::Fill)
                     .into(),
