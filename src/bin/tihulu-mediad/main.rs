@@ -26,7 +26,7 @@ use tokio::{
 use zbus::{
     Connection, Proxy,
     fdo::DBusProxy,
-    zvariant::{ObjectPath, OwnedObjectPath, OwnedValue},
+    zvariant::{OwnedObjectPath, OwnedValue},
 };
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -443,7 +443,7 @@ async fn control_player(
 async fn seek_player(
     connection: &Connection,
     bus_name: &str,
-    track_id: &str,
+    _track_id: &str,
     position_micros: i64,
 ) -> Result<(), String> {
     if !bus_name.starts_with("org.mpris.MediaPlayer2.") {
@@ -452,8 +452,6 @@ async fn seek_player(
     if position_micros < 0 {
         return Err("invalid negative media seek position".to_owned());
     }
-    let path = ObjectPath::try_from(track_id)
-        .map_err(|error| format!("invalid MPRIS track id: {error}"))?;
     let player = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_PLAYER)
         .await
         .map_err(|error| format!("MPRIS player proxy failed: {error}"))?;
@@ -461,10 +459,33 @@ async fn seek_player(
     if !can_seek {
         return Err("MPRIS player does not support seek".to_owned());
     }
-    player
-        .call_method("SetPosition", &(path, position_micros))
+
+    let metadata: HashMap<String, OwnedValue> =
+        player.get_property("Metadata").await.unwrap_or_default();
+    if let Some(path) = metadata
+        .get("mpris:trackid")
+        .and_then(|value| OwnedObjectPath::try_from(value.clone()).ok())
+        && player
+            .call_method("SetPosition", &(path, position_micros))
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
+
+    let current = player
+        .get_property::<OwnedValue>("Position")
         .await
-        .map_err(|error| format!("MPRIS SetPosition failed: {error}"))?;
+        .ok()
+        .as_ref()
+        .and_then(integer_micros)
+        .unwrap_or(0)
+        .max(0);
+    let offset = position_micros.saturating_sub(current);
+    player
+        .call_method("Seek", &(offset,))
+        .await
+        .map_err(|error| format!("MPRIS seek failed: {error}"))?;
     Ok(())
 }
 

@@ -444,13 +444,12 @@ impl MinimizedWindows {
 
         let request = self.media_players.get(&group).and_then(|player| {
             let length = player.length_micros.filter(|length| *length > 0)?;
-            let track_id = player.track_id.clone()?;
             if !player.can_seek {
                 return None;
             }
             Some((
                 player.bus_name.clone(),
-                track_id,
+                player.track_id.clone().unwrap_or_default(),
                 media_position_from_fraction(length, fraction),
             ))
         });
@@ -719,7 +718,7 @@ impl MinimizedWindows {
                 .unwrap_or(current_fraction)
                 .clamp(0.0, 1.0);
             let display_position = media_position_from_fraction(length, display_fraction);
-            let seekable = player.can_seek && player.track_id.is_some();
+            let seekable = player.can_seek;
 
             if seekable {
                 let seek_group = group.to_owned();
