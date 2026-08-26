@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[Unit]
+Description=Tihulu Minimized Windows Preview Daemon
+Documentation=https://github.com/Tihulu/tihulu-cosmic-minimized-windows
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=tihulu-previewd
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+NoNewPrivileges=true
+LimitNOFILE=256
+
+[Install]
+WantedBy=graphical-session.target
