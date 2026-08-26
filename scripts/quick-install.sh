@@ -8,6 +8,8 @@ PREFIX="${PREFIX:-/usr}"
 BIN="tihulu-cosmic-minimized-windows"
 PREVIEW_BIN="tihulu-previewd"
 PREVIEW_SERVICE="tihulu-previewd.service"
+MEDIA_BIN="tihulu-mediad"
+MEDIA_SERVICE="tihulu-mediad.service"
 APP_ID="io.github.tihulu.MinimizedWindows"
 BUILD_DIR=""
 
@@ -66,13 +68,13 @@ ensure_rust() {
   source "$HOME/.cargo/env"
 }
 
-enable_previewd() {
+enable_daemons() {
   if ! need systemctl; then
-    warn "systemctl not found; $PREVIEW_BIN was installed but the user service was not enabled."
+    warn "systemctl not found; preview/media daemons were installed but user services were not enabled."
     return
   fi
 
-  local env_names=(XDG_RUNTIME_DIR)
+  local env_names=(XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS)
   if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     env_names+=(WAYLAND_DISPLAY)
   fi
@@ -80,18 +82,26 @@ enable_previewd() {
     env_names+=(DISPLAY)
   fi
 
-  log "Enabling preview daemon user service"
+  log "Enabling preview/media daemon user services"
   systemctl --user import-environment "${env_names[@]}" >/dev/null 2>&1 || true
   systemctl --user daemon-reload
+
   if ! systemctl --user enable --now "$PREVIEW_SERVICE"; then
     warn "$PREVIEW_SERVICE could not be started. Preview will stay unavailable until previewd is healthy."
-    return
+  fi
+  if ! systemctl --user enable --now "$MEDIA_SERVICE"; then
+    warn "$MEDIA_SERVICE could not be started. Media controls will stay unavailable until mediad is healthy."
   fi
 
   if systemctl --user is-active --quiet "$PREVIEW_SERVICE"; then
     printf 'previewd user service is active.\n'
   else
-    warn "$PREVIEW_SERVICE is not active. Preview will stay unavailable."
+    warn "$PREVIEW_SERVICE is not active."
+  fi
+  if systemctl --user is-active --quiet "$MEDIA_SERVICE"; then
+    printf 'mediad user service is active.\n'
+  else
+    warn "$MEDIA_SERVICE is not active."
   fi
 }
 
@@ -109,11 +119,12 @@ main() {
   cargo check --all-targets
 
   log "Building release binaries"
-  cargo build --release --bin "$BIN" --bin "$PREVIEW_BIN"
+  cargo build --release --bin "$BIN" --bin "$PREVIEW_BIN" --bin "$MEDIA_BIN"
 
   log "Installing"
   sudo install -Dm0755 "target/release/$BIN" "$PREFIX/bin/$BIN"
   sudo install -Dm0755 "target/release/$PREVIEW_BIN" "$PREFIX/bin/$PREVIEW_BIN"
+  sudo install -Dm0755 "target/release/$MEDIA_BIN" "$PREFIX/bin/$MEDIA_BIN"
   sudo install -Dm0644 "resources/$APP_ID.desktop" \
     "$PREFIX/share/applications/$APP_ID.desktop"
   sudo install -Dm0644 "resources/icons/$APP_ID.svg" \
@@ -122,6 +133,8 @@ main() {
     "$PREFIX/share/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg"
   sudo install -Dm0644 "resources/systemd/$PREVIEW_SERVICE" \
     "$PREFIX/lib/systemd/user/$PREVIEW_SERVICE"
+  sudo install -Dm0644 "resources/systemd/$MEDIA_SERVICE" \
+    "$PREFIX/lib/systemd/user/$MEDIA_SERVICE"
 
   if need update-desktop-database; then
     sudo update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
@@ -130,11 +143,12 @@ main() {
     sudo gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
   fi
 
-  enable_previewd
+  enable_daemons
 
   printf '\nTihulu Minimized Windows installed.\n'
   printf 'In COSMIC Settings → Desktop → Dock/Panel, remove the old applet instance and add “Tihulu Minimized Windows” again.\n'
-  printf 'Preview activates only when Safe Core is off, Preview is on, and tihulu-previewd is healthy.\n'
+  printf 'Preview activates when Safe Core is off, Preview is on, and tihulu-previewd is healthy.\n'
+  printf 'Media controls activate when Safe Core is off, Media is on, and tihulu-mediad finds an MPRIS player.\n'
 }
 
 main "$@"
