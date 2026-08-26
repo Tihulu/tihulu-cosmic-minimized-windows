@@ -99,8 +99,11 @@ async fn find_player(
             normalize(&state.bus_name),
             normalize(&state.identity)
         );
-        if !hint.is_empty() && haystack.contains(&hint) {
-            return Ok(Some(state));
+        if !hint.is_empty() {
+            if haystack.contains(&hint) {
+                return Ok(Some(state));
+            }
+            continue;
         }
         if fallback.is_none() && state.playback_status.eq_ignore_ascii_case("Playing") {
             fallback = Some(state);
