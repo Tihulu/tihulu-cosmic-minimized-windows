@@ -39,6 +39,11 @@ const MAX_ARTWORK_CACHE_ENTRIES: usize = 12;
 const ARTWORK_FAILURE_TTL: Duration = Duration::from_secs(60);
 const ARTWORK_DOWNLOAD_TIMEOUT: Duration = Duration::from_millis(1800);
 
+struct RawPlayerState {
+    player: MediaPlayerState,
+    artwork_url: Option<String>,
+}
+
 fn normalize(input: &str) -> String {
     input
         .chars()
@@ -180,6 +185,7 @@ async fn cache_artwork(url: &str) -> Option<String> {
 
     let part = dir.join(format!("{hash:016x}.part"));
     let _ = fs::remove_file(&part);
+    let max_filesize = MAX_ARTWORK_BYTES.to_string();
     let mut command = Command::new("curl");
     command
         .args([
@@ -196,7 +202,7 @@ async fn cache_artwork(url: &str) -> Option<String> {
             "--max-time",
             "1.5",
             "--max-filesize",
-            &MAX_ARTWORK_BYTES.to_string(),
+            max_filesize.as_str(),
             "--output",
         ])
         .arg(&part)
@@ -217,7 +223,12 @@ async fn cache_artwork(url: &str) -> Option<String> {
 
     let valid_size = fs::metadata(&part)
         .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() <= MAX_ARTWORK_BYTES);
-    let Some(extension) = valid_size.then(|| artwork_extension(&part)).flatten() else {
+    let extension = if valid_size {
+        artwork_extension(&part)
+    } else {
+        None
+    };
+    let Some(extension) = extension else {
         let _ = fs::remove_file(&part);
         mark_artwork_failure(&fail);
         trim_artwork_cache(&dir);
@@ -237,7 +248,7 @@ async fn cache_artwork(url: &str) -> Option<String> {
     Some(final_path.to_string_lossy().into_owned())
 }
 
-async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPlayerState, String> {
+async fn read_player_raw(connection: &Connection, bus_name: &str) -> Result<RawPlayerState, String> {
     let root = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_ROOT)
         .await
         .map_err(|error| format!("MPRIS root proxy failed: {error}"))?;
@@ -294,27 +305,38 @@ async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPla
     let can_play: bool = player.get_property("CanPlay").await.unwrap_or(false);
     let can_pause: bool = player.get_property("CanPause").await.unwrap_or(false);
     let can_seek: bool = player.get_property("CanSeek").await.unwrap_or(false);
-    let artwork_path = match artwork_url {
-        Some(url) => cache_artwork(&url).await,
-        None => None,
-    };
 
-    Ok(MediaPlayerState {
-        bus_name: bus_name.to_owned(),
-        identity,
-        playback_status,
-        title,
-        artist,
-        position_micros,
-        length_micros,
-        volume,
-        track_id,
-        artwork_path,
-        can_previous,
-        can_play_pause: can_play || can_pause,
-        can_next,
-        can_seek,
+    Ok(RawPlayerState {
+        player: MediaPlayerState {
+            bus_name: bus_name.to_owned(),
+            identity,
+            playback_status,
+            title,
+            artist,
+            position_micros,
+            length_micros,
+            volume,
+            track_id,
+            artwork_path: None,
+            can_previous,
+            can_play_pause: can_play || can_pause,
+            can_next,
+            can_seek,
+        },
+        artwork_url,
     })
+}
+
+async fn finish_player(mut raw: RawPlayerState) -> MediaPlayerState {
+    if let Some(url) = raw.artwork_url {
+        raw.player.artwork_path = cache_artwork(&url).await;
+    }
+    raw.player
+}
+
+async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPlayerState, String> {
+    let raw = read_player_raw(connection, bus_name).await?;
+    Ok(finish_player(raw).await)
 }
 
 async fn find_player(
@@ -336,25 +358,35 @@ async fn find_player(
         if !bus_name.starts_with("org.mpris.MediaPlayer2.") {
             continue;
         }
-        let Ok(state) = read_player(connection, &bus_name).await else {
+        let Ok(raw) = read_player_raw(connection, &bus_name).await else {
             continue;
         };
         let haystack = format!(
             "{}{}",
-            normalize(&state.bus_name),
-            normalize(&state.identity)
+            normalize(&raw.player.bus_name),
+            normalize(&raw.player.identity)
         );
         if !hints.is_empty() {
             if hints.iter().any(|hint| haystack.contains(hint)) {
-                return Ok(Some(state));
+                return Ok(Some(finish_player(raw).await));
             }
             continue;
         }
-        if fallback.is_none() && state.playback_status.eq_ignore_ascii_case("Playing") {
-            fallback = Some(state);
+        if fallback.is_none()
+            && raw
+                .player
+                .playback_status
+                .eq_ignore_ascii_case("Playing")
+        {
+            fallback = Some(raw);
         }
     }
-    Ok(fallback)
+
+    if let Some(raw) = fallback {
+        Ok(Some(finish_player(raw).await))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn adjust_volume(player: &Proxy<'_>, delta: f64) -> Result<(), String> {
@@ -561,7 +593,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{app_hint_candidates, artwork_extension};
-    use std::{fs, path::PathBuf};
+    use std::fs;
 
     #[test]
     fn spotify_flatpak_id_matches_spotify_mpris_identity() {
@@ -590,6 +622,5 @@ mod tests {
         for path in [png, jpg, bad] {
             let _ = fs::remove_file(path);
         }
-        let _ = PathBuf::new();
     }
 }
