@@ -54,6 +54,18 @@ fn app_hint_candidates(app_hint: &str) -> Vec<String> {
     candidates
 }
 
+fn integer_micros(value: &OwnedValue) -> Option<i64> {
+    i64::try_from(value.clone())
+        .ok()
+        .or_else(|| {
+            u64::try_from(value.clone())
+                .ok()
+                .and_then(|value| i64::try_from(value).ok())
+        })
+        .or_else(|| i32::try_from(value.clone()).ok().map(i64::from))
+        .or_else(|| u32::try_from(value.clone()).ok().map(i64::from))
+}
+
 async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPlayerState, String> {
     let root = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_ROOT)
         .await
@@ -83,12 +95,15 @@ async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPla
         .unwrap_or_default();
     let length_micros = metadata
         .get("mpris:length")
-        .and_then(|value| i64::try_from(value.clone()).ok())
+        .and_then(integer_micros)
         .filter(|length| *length > 0);
-    let position_micros: i64 = player
-        .get_property("Position")
+    let position_micros = player
+        .get_property::<OwnedValue>("Position")
         .await
-        .unwrap_or(0_i64)
+        .ok()
+        .as_ref()
+        .and_then(integer_micros)
+        .unwrap_or(0)
         .max(0);
     let volume = player
         .get_property::<f64>("Volume")
