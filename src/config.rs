@@ -25,22 +25,22 @@ impl FeatureMode {
         // locked until the external preview/media daemons pass their safety gates.
         Self::SafeCore
     }
-
-    fn as_config(self) -> &'static str {
-        // Do not persist an Extended request while the subsystem is unavailable.
-        // This also repairs older v0.4 test configs containing mode=extended.
-        "mode=safe-core\n"
-    }
 }
 
 pub(crate) fn load_feature_mode() -> FeatureMode {
-    config_path()
-        .and_then(|path| fs::read_to_string(path).ok())
+    read_config()
         .map(|contents| FeatureMode::parse(&contents))
         .unwrap_or_default()
 }
 
-pub(crate) fn save_feature_mode(mode: FeatureMode) -> io::Result<()> {
+pub(crate) fn load_hover_popups() -> bool {
+    read_config()
+        .as_deref()
+        .map(parse_hover_popups)
+        .unwrap_or(false)
+}
+
+pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result<()> {
     let Some(path) = config_path() else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -50,8 +50,30 @@ pub(crate) fn save_feature_mode(mode: FeatureMode) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&temporary, mode.as_config())?;
+
+    // Extended remains locked for the v0.4 RC. Hover is independent and is
+    // deliberately opt-in because real COSMIC testing has shown hover-driven
+    // popup churn can restart cosmic-panel on some systems.
+    let _ = mode;
+    let contents = format!(
+        "mode=safe-core\nhover-popups={}\n",
+        if hover_popups { "true" } else { "false" }
+    );
+    fs::write(&temporary, contents)?;
     fs::rename(temporary, path)
+}
+
+fn read_config() -> Option<String> {
+    config_path().and_then(|path| fs::read_to_string(path).ok())
+}
+
+fn parse_hover_popups(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        key.trim() == "hover-popups" && value.trim().eq_ignore_ascii_case("true")
+    })
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -68,7 +90,7 @@ fn config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::FeatureMode;
+    use super::{FeatureMode, parse_hover_popups};
 
     #[test]
     fn all_persisted_modes_are_forced_to_safe_core() {
@@ -80,6 +102,14 @@ mod tests {
     #[test]
     fn extended_request_is_not_effective_in_v04_rc() {
         assert!(FeatureMode::Extended.safe_core());
-        assert_eq!(FeatureMode::Extended.as_config(), "mode=safe-core\n");
+    }
+
+    #[test]
+    fn hover_popups_default_off_and_require_explicit_true() {
+        assert!(!parse_hover_popups(""));
+        assert!(!parse_hover_popups("hover-popups=false\n"));
+        assert!(!parse_hover_popups("hover-popups=1\n"));
+        assert!(parse_hover_popups("mode=safe-core\nhover-popups=true\n"));
+        assert!(parse_hover_popups("hover-popups=TRUE\n"));
     }
 }
