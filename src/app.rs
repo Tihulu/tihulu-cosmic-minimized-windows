@@ -40,6 +40,7 @@ const COMPACT_ROW_HEIGHT_ESTIMATE: f32 = 52.0;
 const PREVIEW_ROW_HEIGHT_ESTIMATE: f32 = 224.0;
 const PREVIEW_WIDTH: f32 = 320.0;
 const PREVIEW_HEIGHT: f32 = 180.0;
+const MEDIA_ARTWORK_SIZE: f32 = 72.0;
 const MAX_APPLET_PREVIEWS: usize = 16;
 
 static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> =
@@ -82,6 +83,7 @@ struct MinimizedWindows {
     preview_healthy: bool,
     preview_health_generation: u64,
     media_players: HashMap<String, MediaPlayerState>,
+    media_seek_drafts: HashMap<String, f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +111,12 @@ enum Message {
         action: MediaAction,
     },
     MediaControlDone(String, Result<(), String>),
+    MediaSeekChanged {
+        group: String,
+        fraction: f32,
+    },
+    MediaSeekCommit(String),
+    MediaSeekDone(String, Result<(), String>),
     PreviewBatchLoaded(Vec<(String, Result<PreviewPayload, String>)>),
     PreviewHealthTick(u64),
     PreviewHealthChecked(u64, Result<(), String>),
@@ -206,6 +214,7 @@ impl MinimizedWindows {
             && self.group_count(group) == 0
         {
             self.media_players.remove(group);
+            self.media_seek_drafts.remove(group);
         }
         RemovedWindow { group, identifier }
     }
@@ -395,6 +404,18 @@ impl MinimizedWindows {
         Task::perform(media_client::control(bus_name, action), move |result| {
             cosmic::Action::App(Message::MediaControlDone(group, result))
         })
+    }
+
+    fn media_seek_task(
+        group: String,
+        bus_name: String,
+        track_id: String,
+        position_micros: i64,
+    ) -> Task<Message> {
+        Task::perform(
+            media_client::seek(bus_name, track_id, position_micros),
+            move |result| cosmic::Action::App(Message::MediaSeekDone(group, result)),
+        )
     }
 
     fn open_group(&mut self, group: String, pinned: bool) -> Task<Message> {
@@ -600,24 +621,68 @@ impl MinimizedWindows {
             }
         };
 
-        let mut children: Vec<cosmic::Element<'a, Message>> = vec![
+        let text_block = cosmic::widget::column::with_children(vec![
             cosmic::widget::text(title).width(Length::Fill).into(),
             cosmic::widget::text(detail).width(Length::Fill).into(),
-        ];
+        ])
+        .spacing(4.0)
+        .width(Length::Fill);
+
+        let mut children: Vec<cosmic::Element<'a, Message>> = Vec::new();
+        if let Some(path) = player.artwork_path.as_deref() {
+            let artwork = Image::new(Handle::from_path(path))
+                .width(Length::Fixed(MEDIA_ARTWORK_SIZE))
+                .height(Length::Fixed(MEDIA_ARTWORK_SIZE))
+                .content_fit(iced::ContentFit::Cover);
+            children.push(
+                cosmic::widget::row::with_children(vec![artwork.into(), text_block.into()])
+                    .spacing(10.0)
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        } else {
+            children.push(text_block.into());
+        }
 
         if let Some(length) = player.length_micros.filter(|length| *length > 0) {
             let position = player.position_micros.clamp(0, length);
-            let progress = (position as f32 / length as f32).clamp(0.0, 1.0);
-            children.push(
-                cosmic::iced::widget::progress_bar(0.0..=1.0, progress)
-                    .length(Length::Fill)
-                    .girth(Length::Fixed(4.0))
+            let current_fraction = (position as f32 / length as f32).clamp(0.0, 1.0);
+            let display_fraction = self
+                .media_seek_drafts
+                .get(group)
+                .copied()
+                .unwrap_or(current_fraction)
+                .clamp(0.0, 1.0);
+            let display_position =
+                ((display_fraction as f64 * length as f64).round() as i64).clamp(0, length);
+
+            if player.can_seek && player.track_id.is_some() {
+                let changed_group = group.to_owned();
+                children.push(
+                    cosmic::iced::widget::slider(0.0..=1.0, display_fraction, move |fraction| {
+                        Message::MediaSeekChanged {
+                            group: changed_group.clone(),
+                            fraction,
+                        }
+                    })
+                    .step(0.001)
+                    .on_release(Message::MediaSeekCommit(group.to_owned()))
+                    .width(Length::Fill)
                     .into(),
-            );
+                );
+            } else {
+                children.push(
+                    cosmic::iced::widget::progress_bar(0.0..=1.0, display_fraction)
+                        .length(Length::Fill)
+                        .girth(Length::Fixed(4.0))
+                        .into(),
+                );
+            }
             children.push(
                 cosmic::widget::text(format!(
                     "{} / {}",
-                    format_media_time(position),
+                    format_media_time(display_position),
                     format_media_time(length)
                 ))
                 .width(Length::Fill)
@@ -976,6 +1041,7 @@ impl cosmic::Application for MinimizedWindows {
                     self.settings.preview_enabled = false;
                     self.settings.hover_popups = false;
                     self.media_players.clear();
+                    self.media_seek_drafts.clear();
                     self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
                     self.preview_healthy = false;
                     self.previews.clear();
@@ -996,6 +1062,7 @@ impl cosmic::Application for MinimizedWindows {
                     self.settings.mode = FeatureMode::Extended;
                 } else {
                     self.media_players.clear();
+                    self.media_seek_drafts.clear();
                 }
                 self.persist_settings();
             }
@@ -1024,6 +1091,7 @@ impl cosmic::Application for MinimizedWindows {
                 }
             }
             Message::MediaLoaded(group, result) => {
+                self.media_seek_drafts.remove(&group);
                 if !self.media_requested() || self.group_count(&group) == 0 {
                     self.media_players.remove(&group);
                 } else {
@@ -1056,6 +1124,52 @@ impl cosmic::Application for MinimizedWindows {
             Message::MediaControlDone(group, result) => {
                 if let Err(error) = result {
                     tracing::warn!(?error, "MPRIS control failed");
+                }
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    return Self::media_status_task(group);
+                }
+            }
+            Message::MediaSeekChanged { group, fraction } => {
+                if self.media_requested()
+                    && self.group_count(&group) > 0
+                    && self
+                        .media_players
+                        .get(&group)
+                        .is_some_and(|player| player.can_seek && player.track_id.is_some())
+                {
+                    self.media_seek_drafts
+                        .insert(group, fraction.clamp(0.0, 1.0));
+                }
+            }
+            Message::MediaSeekCommit(group) => {
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    let request = self.media_players.get(&group).and_then(|player| {
+                        let length = player.length_micros.filter(|length| *length > 0)?;
+                        let track_id = player.track_id.clone()?;
+                        if !player.can_seek {
+                            return None;
+                        }
+                        let fraction = self
+                            .media_seek_drafts
+                            .get(&group)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                (player.position_micros as f32 / length as f32).clamp(0.0, 1.0)
+                            })
+                            .clamp(0.0, 1.0);
+                        let position =
+                            ((fraction as f64 * length as f64).round() as i64).clamp(0, length);
+                        Some((player.bus_name.clone(), track_id, position))
+                    });
+                    if let Some((bus_name, track_id, position)) = request {
+                        return Self::media_seek_task(group, bus_name, track_id, position);
+                    }
+                }
+            }
+            Message::MediaSeekDone(group, result) => {
+                if let Err(error) = result {
+                    self.media_seek_drafts.remove(&group);
+                    tracing::warn!(?error, "MPRIS seek failed");
                 }
                 if self.media_requested() && self.group_count(&group) > 0 {
                     return Self::media_status_task(group);
