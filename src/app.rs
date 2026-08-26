@@ -271,7 +271,23 @@ impl MinimizedWindows {
                 .on_exit(Message::GroupHoverExit(group))
                 .into()
         } else {
-            area.into()
+            let tooltip = self
+                .windows
+                .iter()
+                .filter(|window| window.group_key == group)
+                .map(|window| window.title.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.core
+                .applet
+                .applet_tooltip(
+                    area,
+                    tooltip,
+                    self.popup.is_open(),
+                    Message::Surface,
+                    None,
+                )
+                .into()
         }
     }
 
@@ -577,8 +593,7 @@ impl MinimizedWindows {
                 }
             })
             .sum::<f32>();
-        let viewport_height =
-            total_height.clamp(COMPACT_ROW_HEIGHT_ESTIMATE, POPUP_MAX_HEIGHT);
+        let viewport_height = total_height.clamp(COMPACT_ROW_HEIGHT_ESTIMATE, POPUP_MAX_HEIGHT);
         let list: cosmic::Element<_> = if total_height > POPUP_MAX_HEIGHT {
             cosmic::widget::scrollable::vertical(list)
                 .height(Length::Fixed(viewport_height))
