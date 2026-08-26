@@ -406,12 +406,8 @@ impl MinimizedWindows {
         if pinned && self.media_requested() {
             tasks.push(Self::media_status_task(group.clone()));
         }
-        if pinned && self.preview_requested() {
-            if self.preview_healthy {
-                tasks.push(self.capture_group_task(&group));
-            } else {
-                tasks.push(Self::health_check_task(self.preview_health_generation));
-            }
+        if pinned && self.preview_active() {
+            tasks.push(self.capture_group_task(&group));
         }
         Task::batch(tasks)
     }
