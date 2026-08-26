@@ -28,6 +28,31 @@ fn normalize(input: &str) -> String {
         .collect()
 }
 
+fn app_hint_candidates(app_hint: &str) -> Vec<String> {
+    let normalized = normalize(app_hint.trim_start_matches("browser:"));
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![normalized.clone()];
+    const ALIASES: &[(&str, &str)] = &[
+        ("spotify", "spotify"),
+        ("brave", "brave"),
+        ("firefox", "firefox"),
+        ("chromium", "chromium"),
+        ("googlechrome", "chrome"),
+        ("vivaldi", "vivaldi"),
+        ("opera", "opera"),
+        ("microsoftedge", "edge"),
+    ];
+    for (needle, alias) in ALIASES {
+        if normalized.contains(needle) && !candidates.iter().any(|candidate| candidate == alias) {
+            candidates.push((*alias).to_owned());
+        }
+    }
+    candidates
+}
+
 async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPlayerState, String> {
     let root = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_ROOT)
         .await
@@ -83,7 +108,7 @@ async fn find_player(
         .list_names()
         .await
         .map_err(|error| format!("D-Bus ListNames failed: {error}"))?;
-    let hint = normalize(app_hint.trim_start_matches("browser:"));
+    let hints = app_hint_candidates(app_hint);
     let mut fallback = None;
 
     for name in names {
@@ -99,8 +124,8 @@ async fn find_player(
             normalize(&state.bus_name),
             normalize(&state.identity)
         );
-        if !hint.is_empty() {
-            if haystack.contains(&hint) {
+        if !hints.is_empty() {
+            if hints.iter().any(|hint| haystack.contains(hint)) {
                 return Ok(Some(state));
             }
             continue;
@@ -241,5 +266,22 @@ async fn main() {
     if let Err(error) = result {
         eprintln!("tihulu-mediad: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_hint_candidates;
+
+    #[test]
+    fn spotify_flatpak_id_matches_spotify_mpris_identity() {
+        let candidates = app_hint_candidates("com.spotify.Client");
+        assert!(candidates.iter().any(|candidate| candidate == "spotify"));
+    }
+
+    #[test]
+    fn browser_group_keys_keep_specific_player_matching() {
+        assert_eq!(app_hint_candidates("browser:brave"), vec!["brave"]);
+        assert_eq!(app_hint_candidates("browser:firefox"), vec!["firefox"]);
     }
 }
