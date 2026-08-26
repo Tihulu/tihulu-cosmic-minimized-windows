@@ -10,7 +10,7 @@ use media_ipc::{
     media_socket_path,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
 };
 use zbus::{Connection, Proxy, fdo::DBusProxy, zvariant::OwnedValue};
