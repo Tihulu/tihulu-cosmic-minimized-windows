@@ -4,7 +4,7 @@ use std::{env, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MEDIA_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const MEDIA_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -34,6 +34,8 @@ pub(crate) enum MediaAction {
     Previous,
     PlayPause,
     Next,
+    VolumeDown,
+    VolumeUp,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,6 +45,9 @@ pub(crate) struct MediaPlayerState {
     pub(crate) playback_status: String,
     pub(crate) title: String,
     pub(crate) artist: String,
+    pub(crate) position_micros: i64,
+    pub(crate) length_micros: Option<i64>,
+    pub(crate) volume: Option<f64>,
     pub(crate) can_previous: bool,
     pub(crate) can_play_pause: bool,
     pub(crate) can_next: bool,
