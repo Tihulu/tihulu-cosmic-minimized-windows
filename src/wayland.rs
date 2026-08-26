@@ -76,6 +76,7 @@ pub fn subscription() -> Subscription<BridgeEvent> {
 struct WindowFingerprint {
     app_id: String,
     title: String,
+    identifier: String,
 }
 
 struct BridgeState {
@@ -114,6 +115,7 @@ impl BridgeState {
             let fingerprint = WindowFingerprint {
                 app_id: info.app_id.clone(),
                 title: info.title.clone(),
+                identifier: info.identifier.clone(),
             };
             let changed = self.shown.get(handle) != Some(&fingerprint);
             if changed {
