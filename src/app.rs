@@ -1025,7 +1025,10 @@ impl cosmic::Application for MinimizedWindows {
                         }
                         Err(error) => {
                             self.media_players.remove(&group);
-                            tracing::debug!(?error, "mediad unavailable; normal popup remains active");
+                            tracing::debug!(
+                                ?error,
+                                "mediad unavailable; normal popup remains active"
+                            );
                         }
                     }
                 }
