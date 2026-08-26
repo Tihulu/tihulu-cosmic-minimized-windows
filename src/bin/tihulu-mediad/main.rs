@@ -19,6 +19,7 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 const MPRIS_ROOT: &str = "org.mpris.MediaPlayer2";
 const MPRIS_PLAYER: &str = "org.mpris.MediaPlayer2.Player";
+const VOLUME_STEP: f64 = 0.05;
 
 fn normalize(input: &str) -> String {
     input
@@ -80,6 +81,20 @@ async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPla
         .and_then(|value| Vec::<String>::try_from(value.clone()).ok())
         .map(|artists| artists.join(", "))
         .unwrap_or_default();
+    let length_micros = metadata
+        .get("mpris:length")
+        .and_then(|value| i64::try_from(value.clone()).ok())
+        .filter(|length| *length > 0);
+    let position_micros: i64 = player
+        .get_property("Position")
+        .await
+        .unwrap_or(0_i64)
+        .max(0);
+    let volume = player
+        .get_property::<f64>("Volume")
+        .await
+        .ok()
+        .filter(|value| value.is_finite());
     let can_previous: bool = player.get_property("CanGoPrevious").await.unwrap_or(false);
     let can_next: bool = player.get_property("CanGoNext").await.unwrap_or(false);
     let can_play: bool = player.get_property("CanPlay").await.unwrap_or(false);
@@ -91,6 +106,9 @@ async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPla
         playback_status,
         title,
         artist,
+        position_micros,
+        length_micros,
+        volume,
         can_previous,
         can_play_pause: can_play || can_pause,
         can_next,
@@ -137,6 +155,18 @@ async fn find_player(
     Ok(fallback)
 }
 
+async fn adjust_volume(player: &Proxy<'_>, delta: f64) -> Result<(), String> {
+    let current: f64 = player
+        .get_property("Volume")
+        .await
+        .map_err(|error| format!("MPRIS Volume read failed: {error}"))?;
+    let target = (current + delta).clamp(0.0, 1.0);
+    player
+        .set_property("Volume", target)
+        .await
+        .map_err(|error| format!("MPRIS Volume write failed: {error}"))
+}
+
 async fn control_player(
     connection: &Connection,
     bus_name: &str,
@@ -148,15 +178,29 @@ async fn control_player(
     let player = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_PLAYER)
         .await
         .map_err(|error| format!("MPRIS player proxy failed: {error}"))?;
-    let method = match action {
-        MediaAction::Previous => "Previous",
-        MediaAction::PlayPause => "PlayPause",
-        MediaAction::Next => "Next",
-    };
-    player
-        .call_method(method, &())
-        .await
-        .map_err(|error| format!("MPRIS {method} failed: {error}"))?;
+
+    match action {
+        MediaAction::Previous => {
+            player
+                .call_method("Previous", &())
+                .await
+                .map_err(|error| format!("MPRIS Previous failed: {error}"))?;
+        }
+        MediaAction::PlayPause => {
+            player
+                .call_method("PlayPause", &())
+                .await
+                .map_err(|error| format!("MPRIS PlayPause failed: {error}"))?;
+        }
+        MediaAction::Next => {
+            player
+                .call_method("Next", &())
+                .await
+                .map_err(|error| format!("MPRIS Next failed: {error}"))?;
+        }
+        MediaAction::VolumeDown => adjust_volume(&player, -VOLUME_STEP).await?,
+        MediaAction::VolumeUp => adjust_volume(&player, VOLUME_STEP).await?,
+    }
     Ok(())
 }
 
