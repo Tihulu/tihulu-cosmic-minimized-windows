@@ -410,12 +410,19 @@ impl MinimizedWindows {
         if self.group_count(&group) == 0 {
             return cosmic::task::none();
         }
-        let popup = self.request_popup(group.clone(), pinned);
+
+        let mut tasks = vec![self.request_popup(group.clone(), pinned)];
         if pinned && self.media_requested() {
-            Task::batch([popup, Self::media_status_task(group)])
-        } else {
-            popup
+            tasks.push(Self::media_status_task(group.clone()));
         }
+        if pinned && self.preview_requested() {
+            if self.preview_healthy {
+                tasks.push(self.capture_group_task(&group));
+            } else {
+                tasks.push(Self::health_check_task(self.preview_health_generation));
+            }
+        }
+        Task::batch(tasks)
     }
 
     fn request_settings_open(&mut self) -> Task<Message> {
@@ -458,23 +465,13 @@ impl MinimizedWindows {
         }
     }
 
-    fn capture_task(entry: &Entry) -> Task<Message> {
-        if entry.identifier.is_empty() {
-            return cosmic::task::none();
-        }
-        let key = entry.identifier.clone();
-        let identifier = entry.identifier.clone();
-        let response_key = key.clone();
-        Task::perform(preview_client::capture(key, identifier), move |result| {
-            cosmic::Action::App(Message::PreviewLoaded(response_key, result))
-        })
-    }
-
-    fn capture_all_task(&self) -> Task<Message> {
+    fn capture_group_task(&self, group: &str) -> Task<Message> {
         let requests = self
             .windows
             .iter()
+            .filter(|entry| entry.group_key == group)
             .filter(|entry| !entry.identifier.is_empty())
+            .filter(|entry| !self.previews.contains_key(&entry.identifier))
             .take(MAX_APPLET_PREVIEWS)
             .map(|entry| (entry.identifier.clone(), entry.identifier.clone()))
             .collect::<Vec<_>>();
@@ -571,6 +568,9 @@ impl MinimizedWindows {
     }
 
     fn preview_for(&self, entry: &Entry) -> Option<&PreviewEntry> {
+        if !self.popup.is_pinned() {
+            return None;
+        }
         self.preview_active()
             .then(|| self.previews.get(&entry.identifier))
             .flatten()
@@ -585,7 +585,7 @@ impl MinimizedWindows {
     }
 
     fn media_section<'a>(&'a self, group: &str) -> Option<cosmic::Element<'a, Message>> {
-        if !self.media_requested() {
+        if !self.popup.is_pinned() || !self.media_requested() {
             return None;
         }
         let player = self.media_players.get(group)?;
@@ -790,12 +790,13 @@ impl MinimizedWindows {
         );
     }
 
-    fn preview_failed(&mut self, error: &str) {
-        if self.preview_requested() {
-            self.preview_healthy = false;
-            self.previews.clear();
-            tracing::warn!(?error, "previewd unavailable; compact fallback active");
-        }
+    fn preview_window_failed(&mut self, key: &str, error: &str) {
+        self.previews.remove(key);
+        tracing::debug!(
+            preview_key = key,
+            ?error,
+            "preview capture failed; compact fallback kept for this window"
+        );
     }
 }
 
@@ -844,31 +845,7 @@ impl cosmic::Application for MinimizedWindows {
                     tracing::error!("Minimized-window Wayland bridge stopped");
                 }
                 BridgeEvent::Window(delta) => match *delta {
-                    WindowDelta::Present(info) => {
-                        let handle = info.foreign_toplevel.clone();
-                        let new_identifier = info.identifier.trim().to_owned();
-                        let previous_identifier = self
-                            .windows
-                            .iter()
-                            .find(|entry| entry.handle == handle)
-                            .map(|entry| entry.identifier.clone());
-                        let became_minimized = previous_identifier.is_none();
-                        let identifier_became_available =
-                            previous_identifier.as_deref().is_some_and(str::is_empty)
-                                && !new_identifier.is_empty();
-                        self.upsert(*info);
-
-                        if self.preview_requested()
-                            && (became_minimized || identifier_became_available)
-                        {
-                            return self
-                                .windows
-                                .iter()
-                                .find(|entry| entry.handle == handle)
-                                .map(Self::capture_task)
-                                .unwrap_or_else(cosmic::task::none);
-                        }
-                    }
+                    WindowDelta::Present(info) => self.upsert(*info),
                     WindowDelta::Gone(handle) => {
                         let preview_was_requested = self.preview_requested();
                         let removed = self.remove(&handle);
@@ -890,14 +867,7 @@ impl cosmic::Application for MinimizedWindows {
                 },
             },
             Message::GroupPrimary(group) => {
-                let handles = self.group_handles(&group);
-                if handles.len() == 1 {
-                    if let Some(tx) = &self.command_tx {
-                        let _ = tx.send(BridgeCommand::Restore(handles[0].clone()));
-                    }
-                    return self.close_popup();
-                }
-                if !handles.is_empty() {
+                if self.group_count(&group) > 0 {
                     return self.open_group(group, true);
                 }
             }
@@ -1052,19 +1022,13 @@ impl cosmic::Application for MinimizedWindows {
             }
             Message::PreviewLoaded(key, result) => match result {
                 Ok(payload) => self.accept_preview(key, payload),
-                Err(error) => self.preview_failed(&error),
+                Err(error) => self.preview_window_failed(&key, &error),
             },
             Message::PreviewBatchLoaded(results) => {
-                if let Some(error) = results
-                    .iter()
-                    .find_map(|(_, result)| result.as_ref().err().cloned())
-                {
-                    self.preview_failed(&error);
-                } else {
-                    for (key, result) in results {
-                        if let Ok(payload) = result {
-                            self.accept_preview(key, payload);
-                        }
+                for (key, result) in results {
+                    match result {
+                        Ok(payload) => self.accept_preview(key, payload),
+                        Err(error) => self.preview_window_failed(&key, &error),
                     }
                 }
             }
@@ -1082,10 +1046,16 @@ impl cosmic::Application for MinimizedWindows {
                     Ok(()) => {
                         let was_healthy = self.preview_healthy;
                         self.preview_healthy = true;
-                        if was_healthy {
+                        if was_healthy || !self.popup.is_pinned() {
                             cosmic::task::none()
+                        } else if let Some(group) = self.popup.active_group().map(str::to_owned) {
+                            if group == SETTINGS_GROUP || self.group_count(&group) == 0 {
+                                cosmic::task::none()
+                            } else {
+                                self.capture_group_task(&group)
+                            }
                         } else {
-                            self.capture_all_task()
+                            cosmic::task::none()
                         }
                     }
                     Err(error) => {
