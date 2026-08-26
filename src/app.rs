@@ -1010,8 +1010,7 @@ impl cosmic::Application for MinimizedWindows {
                 });
             if media_playing {
                 subscriptions.push(
-                    cosmic::iced::time::every(MEDIA_UI_TICK_INTERVAL)
-                        .map(|_| Message::MediaUiTick),
+                    cosmic::iced::time::every(MEDIA_UI_TICK_INTERVAL).map(|_| Message::MediaUiTick),
                 );
             }
             Subscription::batch(subscriptions)
@@ -1523,7 +1522,6 @@ fn format_media_time(micros: i64) -> String {
         format!("{minutes}:{seconds:02}")
     }
 }
-
 
 #[cfg(test)]
 mod media_progress_tests {
