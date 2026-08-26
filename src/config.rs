@@ -7,6 +7,7 @@ use std::{
 
 const CONFIG_DIR: &str = "tihulu-cosmic-minimized-windows";
 const CONFIG_FILE: &str = "config";
+const CONFIG_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FeatureMode {
@@ -21,6 +22,13 @@ impl FeatureMode {
     }
 
     fn parse(contents: &str) -> Self {
+        // Older v0.4 RCs forcibly wrote mode=safe-core. Those files did not
+        // carry config-version=2, so treat them as legacy and migrate to the
+        // new normal/default Extended mode instead of preserving a forced state.
+        if parse_config_version(contents) != Some(CONFIG_VERSION) {
+            return Self::Extended;
+        }
+
         contents
             .lines()
             .find_map(|line| {
@@ -78,7 +86,8 @@ pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result
     // fallback switch the user can enable at any time. Hover stays independent
     // and opt-in because hover-driven popup churn was unstable in real COSMIC tests.
     let contents = format!(
-        "mode={}\nhover-popups={}\n",
+        "config-version={}\nmode={}\nhover-popups={}\n",
+        CONFIG_VERSION,
         mode.as_config_value(),
         if hover_popups { "true" } else { "false" }
     );
@@ -88,6 +97,15 @@ pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result
 
 fn read_config() -> Option<String> {
     config_path().and_then(|path| fs::read_to_string(path).ok())
+}
+
+fn parse_config_version(contents: &str) -> Option<u32> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "config-version")
+            .then(|| value.trim().parse::<u32>().ok())
+            .flatten()
+    })
 }
 
 fn parse_hover_popups(contents: &str) -> bool {
@@ -113,14 +131,36 @@ fn config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FeatureMode, parse_hover_popups};
+    use super::{FeatureMode, parse_config_version, parse_hover_popups};
 
     #[test]
-    fn persisted_mode_defaults_to_extended_and_accepts_safe_core() {
+    fn legacy_configs_migrate_to_extended() {
         assert_eq!(FeatureMode::parse(""), FeatureMode::Extended);
-        assert_eq!(FeatureMode::parse("mode=unknown\n"), FeatureMode::Extended);
-        assert_eq!(FeatureMode::parse("mode=safe-core\n"), FeatureMode::SafeCore);
+        assert_eq!(FeatureMode::parse("mode=safe-core\n"), FeatureMode::Extended);
         assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::Extended);
+    }
+
+    #[test]
+    fn versioned_config_persists_explicit_mode() {
+        assert_eq!(
+            FeatureMode::parse("config-version=2\nmode=safe-core\n"),
+            FeatureMode::SafeCore
+        );
+        assert_eq!(
+            FeatureMode::parse("config-version=2\nmode=extended\n"),
+            FeatureMode::Extended
+        );
+        assert_eq!(
+            FeatureMode::parse("config-version=2\nmode=unknown\n"),
+            FeatureMode::Extended
+        );
+    }
+
+    #[test]
+    fn config_version_parser_is_strict() {
+        assert_eq!(parse_config_version("config-version=2\n"), Some(2));
+        assert_eq!(parse_config_version("config-version=1\n"), Some(1));
+        assert_eq!(parse_config_version("config-version=nope\n"), None);
     }
 
     #[test]
