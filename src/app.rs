@@ -24,7 +24,8 @@ use crate::{
 const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const SETTINGS_GROUP: &str = "__tihulu_settings__";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
-const POPUP_WIDTH: f32 = 340.0;
+const POPUP_WIDTH: f32 = 372.0;
+const POPUP_PADDING: f32 = 12.0;
 const POPUP_MAX_HEIGHT: f32 = 420.0;
 const ROW_HEIGHT_ESTIMATE: f32 = 52.0;
 
@@ -420,7 +421,10 @@ impl MinimizedWindows {
 
         let content = cosmic::widget::column::with_children(vec![header.into(), list])
             .spacing(9.0)
-            .width(Length::Fixed(POPUP_WIDTH));
+            .width(Length::Fill);
+        let content = cosmic::widget::container(content)
+            .width(Length::Fixed(POPUP_WIDTH))
+            .padding(POPUP_PADDING);
 
         cosmic::widget::mouse_area(content)
             .on_enter(Message::PopupEnter)
@@ -463,19 +467,23 @@ impl MinimizedWindows {
             "Preview backend: disabled"
         };
 
-        cosmic::widget::column::with_children(vec![
+        let content = cosmic::widget::column::with_children(vec![
             title.into(),
             safe_core.into(),
             media.into(),
             preview.into(),
             hover.into(),
-            cosmic::widget::text(mode_note).into(),
-            cosmic::widget::text(media_note).into(),
-            cosmic::widget::text(preview_note).into(),
+            cosmic::widget::text(mode_note).width(Length::Fill).into(),
+            cosmic::widget::text(media_note).width(Length::Fill).into(),
+            cosmic::widget::text(preview_note).width(Length::Fill).into(),
         ])
         .spacing(10.0)
-        .width(Length::Fixed(POPUP_WIDTH))
-        .into()
+        .width(Length::Fill);
+
+        cosmic::widget::container(content)
+            .width(Length::Fixed(POPUP_WIDTH))
+            .padding(POPUP_PADDING)
+            .into()
     }
 }
 
