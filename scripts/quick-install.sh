@@ -82,14 +82,19 @@ enable_daemons() {
     env_names+=(DISPLAY)
   fi
 
-  log "Enabling preview/media daemon user services"
+  log "Enabling and restarting preview/media daemon user services"
   systemctl --user import-environment "${env_names[@]}" >/dev/null 2>&1 || true
   systemctl --user daemon-reload
 
-  if ! systemctl --user enable --now "$PREVIEW_SERVICE"; then
+  if ! systemctl --user enable "$PREVIEW_SERVICE"; then
+    warn "$PREVIEW_SERVICE could not be enabled."
+  elif ! systemctl --user restart "$PREVIEW_SERVICE"; then
     warn "$PREVIEW_SERVICE could not be started. Preview will stay unavailable until previewd is healthy."
   fi
-  if ! systemctl --user enable --now "$MEDIA_SERVICE"; then
+
+  if ! systemctl --user enable "$MEDIA_SERVICE"; then
+    warn "$MEDIA_SERVICE could not be enabled."
+  elif ! systemctl --user restart "$MEDIA_SERVICE"; then
     warn "$MEDIA_SERVICE could not be started. Media controls will stay unavailable until mediad is healthy."
   fi
 
