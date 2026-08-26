@@ -7,7 +7,7 @@ use std::{
 
 const CONFIG_DIR: &str = "tihulu-cosmic-minimized-windows";
 const CONFIG_FILE: &str = "config";
-const CONFIG_VERSION: u32 = 3;
+const CONFIG_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FeatureMode {
@@ -95,8 +95,9 @@ fn read_config() -> Option<String> {
 }
 
 fn parse_settings(contents: &str) -> Settings {
-    // v0.4 RC configs before v3 contained forced Safe Core state and partial
-    // hover-only settings. Migrate them to the new user-facing defaults once.
+    // Configs before v4 may contain feature switches that were turned off
+    // automatically by earlier Safe Core experiments. Reset them once to the
+    // new normal-user defaults, then preserve all v4 choices independently.
     if parse_config_version(contents) != Some(CONFIG_VERSION) {
         return Settings::default();
     }
@@ -176,10 +177,12 @@ mod tests {
     }
 
     #[test]
-    fn old_rc_configs_migrate_to_new_defaults() {
+    fn old_configs_migrate_to_new_defaults() {
         assert_eq!(parse_settings(""), Settings::default());
         assert_eq!(
-            parse_settings("config-version=2\nmode=safe-core\nhover-popups=true\n"),
+            parse_settings(
+                "config-version=3\nmode=extended\nmedia=false\npreview=false\nhover-popups=false\n"
+            ),
             Settings::default()
         );
     }
@@ -188,7 +191,7 @@ mod tests {
     fn versioned_settings_persist_independently() {
         assert_eq!(
             parse_settings(
-                "config-version=3\nmode=safe-core\nmedia=false\npreview=true\nhover-popups=true\n"
+                "config-version=4\nmode=safe-core\nmedia=false\npreview=true\nhover-popups=true\n"
             ),
             Settings {
                 mode: FeatureMode::SafeCore,
@@ -203,7 +206,7 @@ mod tests {
     fn invalid_values_keep_defaults() {
         assert_eq!(
             parse_settings(
-                "config-version=3\nmode=nope\nmedia=nope\npreview=nope\nhover-popups=nope\n"
+                "config-version=4\nmode=nope\nmedia=nope\npreview=nope\nhover-popups=nope\n"
             ),
             Settings::default()
         );
@@ -211,8 +214,8 @@ mod tests {
 
     #[test]
     fn config_version_parser_is_strict() {
+        assert_eq!(parse_config_version("config-version=4\n"), Some(4));
         assert_eq!(parse_config_version("config-version=3\n"), Some(3));
-        assert_eq!(parse_config_version("config-version=2\n"), Some(2));
         assert_eq!(parse_config_version("config-version=nope\n"), None);
     }
 }

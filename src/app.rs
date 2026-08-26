@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{borrow::Cow, collections::HashSet, sync::LazyLock, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+    time::Duration,
+};
 
 use cctk::toplevel_info::ToplevelInfo;
 use cosmic::{
@@ -12,22 +17,28 @@ use cosmic::{
     },
     desktop::{IconSourceExt, fde},
     iced::{self, Length, Limits, Subscription, id::Id as WidgetId, window::Id as WindowId},
-    widget::autosize::autosize,
+    widget::{Image, autosize::autosize, image::Handle},
 };
 
 use crate::{
     config::{self, FeatureMode, Settings},
     popup::{CloseGuard, CloseOutcome, OpenPlan, PopupFsm},
+    preview_client::{self, PreviewPayload},
     wayland::{self, BridgeCommand, BridgeEvent, WindowDelta},
 };
 
 const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const SETTINGS_GROUP: &str = "__tihulu_settings__";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
+const PREVIEW_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const POPUP_WIDTH: f32 = 372.0;
 const POPUP_PADDING: f32 = 12.0;
 const POPUP_MAX_HEIGHT: f32 = 420.0;
-const ROW_HEIGHT_ESTIMATE: f32 = 52.0;
+const COMPACT_ROW_HEIGHT_ESTIMATE: f32 = 52.0;
+const PREVIEW_ROW_HEIGHT_ESTIMATE: f32 = 224.0;
+const PREVIEW_WIDTH: f32 = 320.0;
+const PREVIEW_HEIGHT: f32 = 180.0;
+const MAX_APPLET_PREVIEWS: usize = 16;
 
 static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> =
     LazyLock::new(|| WidgetId::new("tihulu-minimized-windows-main"));
@@ -38,10 +49,22 @@ pub(crate) fn run() -> cosmic::iced::Result {
 
 struct Entry {
     handle: ExtForeignToplevelHandleV1,
+    identifier: String,
     group_key: String,
     app_label: String,
     title: String,
     icon: fde::IconSource,
+}
+
+#[derive(Clone)]
+struct PreviewEntry {
+    generation: u64,
+    handle: Handle,
+}
+
+struct RemovedWindow {
+    group: Option<String>,
+    identifier: Option<String>,
 }
 
 #[derive(Default)]
@@ -53,6 +76,9 @@ struct MinimizedWindows {
     command_tx: Option<calloop::channel::Sender<BridgeCommand>>,
     popup: PopupFsm,
     settings: Settings,
+    previews: HashMap<String, PreviewEntry>,
+    preview_healthy: bool,
+    preview_health_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +99,11 @@ enum Message {
     ToggleMedia(bool),
     TogglePreview(bool),
     ToggleHover(bool),
+    PreviewLoaded(String, Result<PreviewPayload, String>),
+    PreviewBatchLoaded(Vec<(String, Result<PreviewPayload, String>)>),
+    PreviewHealthTick(u64),
+    PreviewHealthChecked(u64, Result<(), String>),
+    PreviewMaintenanceDone,
     Surface(cosmic::surface::Action),
 }
 
@@ -117,6 +148,7 @@ impl MinimizedWindows {
 
     fn upsert(&mut self, info: ToplevelInfo) {
         let handle = info.foreign_toplevel.clone();
+        let identifier = info.identifier.trim().to_owned();
         let app_id = info.app_id.trim().to_owned();
         let (app_label, icon, group_key) = self.app_visuals(&app_id);
         let title = if info.title.trim().is_empty() {
@@ -127,6 +159,7 @@ impl MinimizedWindows {
 
         let entry = Entry {
             handle: handle.clone(),
+            identifier,
             group_key,
             app_label,
             title,
@@ -144,14 +177,23 @@ impl MinimizedWindows {
         }
     }
 
-    fn remove(&mut self, handle: &ExtForeignToplevelHandleV1) -> Option<String> {
+    fn remove(&mut self, handle: &ExtForeignToplevelHandleV1) -> RemovedWindow {
         let group = self
             .windows
             .iter()
             .find(|entry| &entry.handle == handle)
             .map(|entry| entry.group_key.clone());
+        let identifier = self
+            .windows
+            .iter()
+            .find(|entry| &entry.handle == handle)
+            .map(|entry| entry.identifier.clone())
+            .filter(|identifier| !identifier.is_empty());
         self.windows.retain(|window| &window.handle != handle);
-        group
+        if let Some(identifier) = identifier.as_deref() {
+            self.previews.remove(identifier);
+        }
+        RemovedWindow { group, identifier }
     }
 
     fn group_count(&self, group: &str) -> usize {
@@ -181,6 +223,14 @@ impl MinimizedWindows {
             }
         }
         index
+    }
+
+    fn preview_requested(&self) -> bool {
+        !self.settings.mode.safe_core() && self.settings.preview_enabled
+    }
+
+    fn preview_active(&self) -> bool {
+        self.preview_requested() && self.preview_healthy
     }
 
     fn group_button<'a>(&self, entry: &'a Entry, count: usize) -> cosmic::Element<'a, Message> {
@@ -221,7 +271,17 @@ impl MinimizedWindows {
                 .on_exit(Message::GroupHoverExit(group))
                 .into()
         } else {
-            area.into()
+            let tooltip = self
+                .windows
+                .iter()
+                .filter(|window| window.group_key == group)
+                .map(|window| window.title.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.core
+                .applet
+                .applet_tooltip(area, tooltip, self.popup.is_open(), Message::Surface, None)
+                .into()
         }
     }
 
@@ -364,7 +424,66 @@ impl MinimizedWindows {
         }
     }
 
-    fn window_row<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
+    fn capture_task(entry: &Entry) -> Task<Message> {
+        if entry.identifier.is_empty() {
+            return cosmic::task::none();
+        }
+        let key = entry.identifier.clone();
+        let identifier = entry.identifier.clone();
+        let response_key = key.clone();
+        Task::perform(preview_client::capture(key, identifier), move |result| {
+            cosmic::Action::App(Message::PreviewLoaded(response_key, result))
+        })
+    }
+
+    fn capture_all_task(&self) -> Task<Message> {
+        let requests = self
+            .windows
+            .iter()
+            .filter(|entry| !entry.identifier.is_empty())
+            .take(MAX_APPLET_PREVIEWS)
+            .map(|entry| (entry.identifier.clone(), entry.identifier.clone()))
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return cosmic::task::none();
+        }
+        Task::perform(preview_client::capture_many(requests), |results| {
+            cosmic::Action::App(Message::PreviewBatchLoaded(results))
+        })
+    }
+
+    fn health_delay_task(generation: u64) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::time::sleep(PREVIEW_HEALTH_INTERVAL).await;
+                generation
+            },
+            |generation| cosmic::Action::App(Message::PreviewHealthTick(generation)),
+        )
+    }
+
+    fn health_check_task(generation: u64) -> Task<Message> {
+        Task::perform(preview_client::health(), move |result| {
+            cosmic::Action::App(Message::PreviewHealthChecked(generation, result))
+        })
+    }
+
+    fn clear_preview_task() -> Task<Message> {
+        Task::perform(preview_client::clear(), |_| {
+            cosmic::Action::App(Message::PreviewMaintenanceDone)
+        })
+    }
+
+    fn gone_task(identifier: Option<String>) -> Task<Message> {
+        let Some(identifier) = identifier else {
+            return cosmic::task::none();
+        };
+        Task::perform(preview_client::gone(identifier), |_| {
+            cosmic::Action::App(Message::PreviewMaintenanceDone)
+        })
+    }
+
+    fn compact_window_row<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
         let icon = cosmic::widget::icon(entry.icon.as_cosmic_icon())
             .width(Length::Fixed(36.0))
             .height(Length::Fixed(36.0));
@@ -385,6 +504,50 @@ impl MinimizedWindows {
             .align_y(iced::Alignment::Center)
             .width(Length::Fill)
             .into()
+    }
+
+    fn preview_window_row<'a>(
+        &self,
+        entry: &'a Entry,
+        preview: &PreviewEntry,
+    ) -> cosmic::Element<'a, Message> {
+        let image = Image::new(preview.handle.clone())
+            .width(Length::Fixed(PREVIEW_WIDTH))
+            .height(Length::Fixed(PREVIEW_HEIGHT))
+            .content_fit(iced::ContentFit::Contain);
+        let restore = cosmic::widget::button::custom(image)
+            .padding(0)
+            .on_press(Message::Restore(entry.handle.clone()));
+        let footer = cosmic::widget::row::with_children(vec![
+            cosmic::widget::text(&entry.title)
+                .width(Length::Fill)
+                .into(),
+            cosmic::widget::button::text("×")
+                .on_press(Message::CloseWindow(entry.handle.clone()))
+                .into(),
+        ])
+        .spacing(6.0)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill);
+
+        cosmic::widget::column::with_children(vec![restore.into(), footer.into()])
+            .spacing(5.0)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn preview_for(&self, entry: &Entry) -> Option<&PreviewEntry> {
+        self.preview_active()
+            .then(|| self.previews.get(&entry.identifier))
+            .flatten()
+    }
+
+    fn window_row<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
+        if let Some(preview) = self.preview_for(entry) {
+            self.preview_window_row(entry, preview)
+        } else {
+            self.compact_window_row(entry)
+        }
     }
 
     fn group_popup_view(&self) -> cosmic::Element<'_, Message> {
@@ -412,13 +575,22 @@ impl MinimizedWindows {
             .map(|entry| self.window_row(entry))
             .collect::<Vec<_>>();
         let list = cosmic::widget::column::with_children(rows)
-            .spacing(6.0)
+            .spacing(8.0)
             .width(Length::Fill);
-        let estimated_height = (entries.len() as f32 * ROW_HEIGHT_ESTIMATE)
-            .clamp(ROW_HEIGHT_ESTIMATE, POPUP_MAX_HEIGHT);
-        let list: cosmic::Element<_> = if entries.len() > 7 {
+        let total_height = entries
+            .iter()
+            .map(|entry| {
+                if self.preview_for(entry).is_some() {
+                    PREVIEW_ROW_HEIGHT_ESTIMATE
+                } else {
+                    COMPACT_ROW_HEIGHT_ESTIMATE
+                }
+            })
+            .sum::<f32>();
+        let viewport_height = total_height.clamp(COMPACT_ROW_HEIGHT_ESTIMATE, POPUP_MAX_HEIGHT);
+        let list: cosmic::Element<_> = if total_height > POPUP_MAX_HEIGHT {
             cosmic::widget::scrollable::vertical(list)
-                .height(Length::Fixed(estimated_height))
+                .height(Length::Fixed(viewport_height))
                 .width(Length::Fill)
                 .into()
         } else {
@@ -460,17 +632,19 @@ impl MinimizedWindows {
         let mode_note = if self.settings.mode.safe_core() {
             "Safe Core is active. Media, Preview and Hover are off. Enabling any rich option exits Safe Core."
         } else {
-            "Safe Core is off. Media and Preview are saved preferences, but their daemon backends are not connected in this build yet."
+            "Safe Core is off. Preview uses the external daemon when healthy; unavailable windows keep the compact fallback."
         };
         let media_note = if self.settings.media_enabled {
             "Media backend: enabled preference · tihulu-mediad not connected yet"
         } else {
             "Media backend: disabled"
         };
-        let preview_note = if self.settings.preview_enabled {
-            "Preview backend: enabled preference · tihulu-previewd not connected on this branch yet"
-        } else {
+        let preview_note = if !self.settings.preview_enabled {
             "Preview backend: disabled"
+        } else if self.preview_healthy {
+            "Preview backend: active · tihulu-previewd healthy"
+        } else {
+            "Preview backend: enabled · tihulu-previewd unavailable or waiting; compact fallback active"
         };
 
         let content = cosmic::widget::column::with_children(vec![
@@ -493,6 +667,44 @@ impl MinimizedWindows {
             .padding(POPUP_PADDING)
             .into()
     }
+
+    fn accept_preview(&mut self, key: String, payload: PreviewPayload) {
+        if !self.preview_requested()
+            || payload.key != key
+            || !self.windows.iter().any(|entry| entry.identifier == key)
+        {
+            return;
+        }
+        if self
+            .previews
+            .get(&key)
+            .is_some_and(|current| current.generation > payload.generation)
+        {
+            return;
+        }
+        if !self.previews.contains_key(&key)
+            && self.previews.len() >= MAX_APPLET_PREVIEWS
+            && let Some(victim) = self.previews.keys().next().cloned()
+        {
+            self.previews.remove(&victim);
+        }
+        let handle = Handle::from_rgba(payload.width, payload.height, payload.rgba);
+        self.previews.insert(
+            key,
+            PreviewEntry {
+                generation: payload.generation,
+                handle,
+            },
+        );
+    }
+
+    fn preview_failed(&mut self, error: &str) {
+        if self.preview_requested() {
+            self.preview_healthy = false;
+            self.previews.clear();
+            tracing::warn!(?error, "previewd unavailable; compact fallback active");
+        }
+    }
 }
 
 impl cosmic::Application for MinimizedWindows {
@@ -510,7 +722,13 @@ impl cosmic::Application for MinimizedWindows {
             ..Default::default()
         };
         app.reload_desktop_entries();
-        (app, cosmic::task::none())
+        if app.preview_requested() {
+            app.preview_health_generation = 1;
+            let generation = app.preview_health_generation;
+            (app, Self::health_check_task(generation))
+        } else {
+            (app, cosmic::task::none())
+        }
     }
 
     fn core(&self) -> &cosmic::app::Core {
@@ -534,15 +752,48 @@ impl cosmic::Application for MinimizedWindows {
                     tracing::error!("Minimized-window Wayland bridge stopped");
                 }
                 BridgeEvent::Window(delta) => match *delta {
-                    WindowDelta::Present(info) => self.upsert(*info),
+                    WindowDelta::Present(info) => {
+                        let handle = info.foreign_toplevel.clone();
+                        let new_identifier = info.identifier.trim().to_owned();
+                        let previous_identifier = self
+                            .windows
+                            .iter()
+                            .find(|entry| entry.handle == handle)
+                            .map(|entry| entry.identifier.clone());
+                        let became_minimized = previous_identifier.is_none();
+                        let identifier_became_available =
+                            previous_identifier.as_deref().is_some_and(str::is_empty)
+                                && !new_identifier.is_empty();
+                        self.upsert(*info);
+
+                        if self.preview_requested()
+                            && (became_minimized || identifier_became_available)
+                        {
+                            return self
+                                .windows
+                                .iter()
+                                .find(|entry| entry.handle == handle)
+                                .map(Self::capture_task)
+                                .unwrap_or_else(cosmic::task::none);
+                        }
+                    }
                     WindowDelta::Gone(handle) => {
-                        let removed_group = self.remove(&handle);
-                        let active_disappeared = removed_group.as_deref().is_some_and(|group| {
+                        let preview_was_requested = self.preview_requested();
+                        let removed = self.remove(&handle);
+                        let active_disappeared = removed.group.as_deref().is_some_and(|group| {
                             self.popup.active_group() == Some(group) && self.group_count(group) == 0
                         });
-                        if active_disappeared {
-                            return self.close_popup();
-                        }
+                        let close = if active_disappeared {
+                            self.close_popup()
+                        } else {
+                            cosmic::task::none()
+                        };
+                        let maintenance = if preview_was_requested {
+                            Self::gone_task(removed.identifier)
+                        } else {
+                            cosmic::task::none()
+                        };
+                        return Task::batch([close, maintenance]);
                     }
                 },
             },
@@ -621,14 +872,19 @@ impl cosmic::Application for MinimizedWindows {
                     self.settings.media_enabled = false;
                     self.settings.preview_enabled = false;
                     self.settings.hover_popups = false;
+                    self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
+                    self.preview_healthy = false;
+                    self.previews.clear();
                     self.persist_settings();
-                    if close_hover_popup {
-                        return self.close_popup();
-                    }
-                } else {
-                    self.settings.mode = FeatureMode::Extended;
-                    self.persist_settings();
+                    let close = if close_hover_popup {
+                        self.close_popup()
+                    } else {
+                        cosmic::task::none()
+                    };
+                    return Task::batch([close, Self::clear_preview_task()]);
                 }
+                self.settings.mode = FeatureMode::Extended;
+                self.persist_settings();
             }
             Message::ToggleMedia(enabled) => {
                 self.settings.media_enabled = enabled;
@@ -639,10 +895,17 @@ impl cosmic::Application for MinimizedWindows {
             }
             Message::TogglePreview(enabled) => {
                 self.settings.preview_enabled = enabled;
+                self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
+                let generation = self.preview_health_generation;
+                self.preview_healthy = false;
+                self.previews.clear();
                 if enabled {
                     self.settings.mode = FeatureMode::Extended;
+                    self.persist_settings();
+                    return Self::health_check_task(generation);
                 }
                 self.persist_settings();
+                return Self::clear_preview_task();
             }
             Message::ToggleHover(enabled) => {
                 self.settings.hover_popups = enabled;
@@ -654,6 +917,59 @@ impl cosmic::Application for MinimizedWindows {
                     return self.close_popup();
                 }
             }
+            Message::PreviewLoaded(key, result) => match result {
+                Ok(payload) => self.accept_preview(key, payload),
+                Err(error) => self.preview_failed(&error),
+            },
+            Message::PreviewBatchLoaded(results) => {
+                if let Some(error) = results
+                    .iter()
+                    .find_map(|(_, result)| result.as_ref().err().cloned())
+                {
+                    self.preview_failed(&error);
+                } else {
+                    for (key, result) in results {
+                        if let Ok(payload) = result {
+                            self.accept_preview(key, payload);
+                        }
+                    }
+                }
+            }
+            Message::PreviewHealthTick(generation) => {
+                if generation == self.preview_health_generation && self.preview_requested() {
+                    return Self::health_check_task(generation);
+                }
+            }
+            Message::PreviewHealthChecked(generation, result) => {
+                if generation != self.preview_health_generation || !self.preview_requested() {
+                    return cosmic::task::none();
+                }
+
+                let recovery = match result {
+                    Ok(()) => {
+                        let was_healthy = self.preview_healthy;
+                        self.preview_healthy = true;
+                        if was_healthy {
+                            cosmic::task::none()
+                        } else {
+                            self.capture_all_task()
+                        }
+                    }
+                    Err(error) => {
+                        if self.preview_healthy || !self.previews.is_empty() {
+                            tracing::warn!(
+                                ?error,
+                                "previewd health check failed; compact fallback active"
+                            );
+                        }
+                        self.preview_healthy = false;
+                        self.previews.clear();
+                        cosmic::task::none()
+                    }
+                };
+                return Task::batch([recovery, Self::health_delay_task(generation)]);
+            }
+            Message::PreviewMaintenanceDone => {}
             Message::Surface(action) => {
                 return cosmic::task::message(cosmic::Action::Cosmic(
                     cosmic::app::Action::Surface(action),
