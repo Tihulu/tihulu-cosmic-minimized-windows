@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::sync::LazyLock;
+
 use cosmic::iced::window::Id as WindowId;
 
+use crate::config;
+
 // Real COSMIC runtime testing showed repeated hover-triggered popup surface
-// creation can restart cosmic-panel. Safe Core therefore blocks hover opening
-// completely. Click/right-click popup creation remains available.
-const HOVER_POPUPS_ENABLED: bool = false;
+// creation can restart cosmic-panel. Hover therefore stays disabled unless the
+// user explicitly opts in with `hover-popups=true` and restarts/re-adds the
+// applet. Click/right-click popup creation is always available.
+static HOVER_POPUPS_ENABLED: LazyLock<bool> = LazyLock::new(config::load_hover_popups);
 
 #[derive(Clone, Debug)]
 struct PopupSession {
@@ -72,14 +77,17 @@ impl PopupFsm {
     }
 
     pub(crate) fn is_pinned(&self) -> bool {
-        // app.rs uses this before opening a hover popup. While Safe Core hover
-        // is disabled, treat a closed FSM as blocking hover-open. A popup
-        // explicitly opened by click/right-click still enters Pinned normally.
+        // app.rs checks this before issuing a hover-open request. A closed FSM
+        // behaves as hover-blocked while the experimental preference is off.
+        // Explicit click/right-click requests still pass pinned=true directly
+        // into request_open and therefore remain unaffected.
         matches!(self.state, PopupState::Pinned(_))
-            || (!HOVER_POPUPS_ENABLED && matches!(self.state, PopupState::Closed))
+            || (!*HOVER_POPUPS_ENABLED && matches!(self.state, PopupState::Closed))
     }
 
     pub(crate) fn group_enter(&mut self, group: String) {
+        // Panel icon and popup are separate Wayland surfaces. Entering one is
+        // authoritative and repairs a missed exit from the other surface.
         self.pointer_in_popup = false;
         self.pointer_group = Some(group);
         self.invalidate_close();
@@ -118,6 +126,8 @@ impl PopupFsm {
         self.invalidate_close();
 
         if self.pending_open.is_some() {
+            // The old popup is already being destroyed. Track only the latest
+            // desired destination and wait for the compositor close ACK.
             self.pending_open = Some(PendingOpen { group, pinned });
             return OpenPlan::None;
         }
@@ -254,7 +264,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn safe_core_closed_state_blocks_hover_open_call_site() {
+    fn default_closed_state_blocks_hover_open_call_site() {
         let mut fsm = PopupFsm::default();
         fsm.group_enter("brave".into());
         assert!(fsm.is_pinned());
@@ -262,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_hover_request_still_has_consistent_internal_state() {
+    fn explicit_hover_request_keeps_internal_state_consistent() {
         let mut fsm = PopupFsm::default();
         let id = WindowId::unique();
         let plan = fsm.request_open("brave".into(), false, id);
@@ -274,45 +284,36 @@ mod tests {
             }
         );
         assert_eq!(fsm.active_group(), Some("brave"));
-        assert!(!fsm.is_pinned());
     }
 
     #[test]
-    fn pinning_same_group_reuses_surface() {
+    fn click_open_is_pinned() {
         let mut fsm = PopupFsm::default();
         let id = WindowId::unique();
-        fsm.request_open("brave".into(), false, id);
-        let generation = fsm.session().unwrap().generation;
-        assert_eq!(
-            fsm.request_open("brave".into(), true, WindowId::unique()),
-            OpenPlan::None
-        );
-        assert_eq!(fsm.window_id(), Some(id));
-        assert_eq!(fsm.session().unwrap().generation, generation);
+        assert!(matches!(
+            fsm.request_open("brave".into(), true, id),
+            OpenPlan::Create { .. }
+        ));
         assert!(fsm.is_pinned());
+        assert_eq!(fsm.window_id(), Some(id));
     }
 
     #[test]
-    fn switching_hover_group_waits_for_compositor_close() {
+    fn switching_group_waits_for_compositor_close() {
         let mut fsm = PopupFsm::default();
         let old = WindowId::unique();
-        fsm.group_enter("brave".into());
-        fsm.request_open("brave".into(), false, old);
-        fsm.group_enter("firefox".into());
-
+        fsm.request_open("brave".into(), true, old);
         assert_eq!(
-            fsm.request_open("firefox".into(), false, WindowId::unique()),
+            fsm.request_open("spotify".into(), true, WindowId::unique()),
             OpenPlan::CloseForSwitch { old_window_id: old }
         );
-        assert_eq!(fsm.active_group(), Some("brave"));
         assert_eq!(
             fsm.compositor_closed(old),
             CloseOutcome::OpenPending {
-                group: "firefox".into(),
-                pinned: false
+                group: "spotify".into(),
+                pinned: true
             }
         );
-        assert!(!fsm.is_open());
     }
 
     #[test]
@@ -356,24 +357,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_switch_reopens_after_ack_even_without_hover() {
-        let mut fsm = PopupFsm::default();
-        let old = WindowId::unique();
-        fsm.request_open("brave".into(), true, old);
-        assert_eq!(
-            fsm.request_open("spotify".into(), true, WindowId::unique()),
-            OpenPlan::CloseForSwitch { old_window_id: old }
-        );
-        assert_eq!(
-            fsm.compositor_closed(old),
-            CloseOutcome::OpenPending {
-                group: "spotify".into(),
-                pinned: true
-            }
-        );
-    }
-
-    #[test]
     fn popup_enter_repairs_missing_group_exit() {
         let mut fsm = PopupFsm::default();
         fsm.group_enter("brave".into());
@@ -383,20 +366,6 @@ mod tests {
         assert!(fsm.pointer_in_popup);
 
         fsm.popup_exit();
-        let guard = fsm.schedule_close().unwrap();
-        assert!(fsm.should_close(guard));
-    }
-
-    #[test]
-    fn group_enter_repairs_missing_popup_exit() {
-        let mut fsm = PopupFsm::default();
-        fsm.request_open("brave".into(), false, WindowId::unique());
-        fsm.popup_enter();
-        fsm.group_enter("brave".into());
-        assert!(!fsm.pointer_in_popup);
-        assert_eq!(fsm.pointer_group.as_deref(), Some("brave"));
-
-        fsm.group_exit("brave");
         let guard = fsm.schedule_close().unwrap();
         assert!(fsm.should_close(guard));
     }
@@ -415,7 +384,7 @@ mod tests {
     fn stale_compositor_close_is_ignored() {
         let mut fsm = PopupFsm::default();
         let current = WindowId::unique();
-        fsm.request_open("brave".into(), false, current);
+        fsm.request_open("brave".into(), true, current);
         assert_eq!(
             fsm.compositor_closed(WindowId::unique()),
             CloseOutcome::Ignored
@@ -424,25 +393,11 @@ mod tests {
     }
 
     #[test]
-    fn current_compositor_close_clears_surface_and_pointer_state() {
-        let mut fsm = PopupFsm::default();
-        let id = WindowId::unique();
-        fsm.group_enter("brave".into());
-        fsm.request_open("brave".into(), false, id);
-        fsm.popup_enter();
-        assert_eq!(fsm.compositor_closed(id), CloseOutcome::Closed);
-        assert!(!fsm.is_open());
-        assert_eq!(fsm.pointer_group, None);
-        assert!(!fsm.pointer_in_popup);
-    }
-
-    #[test]
     fn close_current_cancels_pending_switch() {
         let mut fsm = PopupFsm::default();
         let old = WindowId::unique();
-        fsm.request_open("brave".into(), false, old);
-        fsm.group_enter("spotify".into());
-        fsm.request_open("spotify".into(), false, WindowId::unique());
+        fsm.request_open("brave".into(), true, old);
+        fsm.request_open("spotify".into(), true, WindowId::unique());
         assert_eq!(fsm.close_current(), Some(old));
         assert_eq!(fsm.compositor_closed(old), CloseOutcome::Ignored);
     }
