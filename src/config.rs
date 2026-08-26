@@ -17,13 +17,32 @@ pub(crate) enum FeatureMode {
 
 impl FeatureMode {
     pub(crate) fn safe_core(self) -> bool {
-        true
+        matches!(self, Self::SafeCore)
     }
 
-    fn parse(_contents: &str) -> Self {
-        // v0.4 is a runtime-validation release candidate. Extended mode stays
-        // locked until the external preview/media daemons pass their safety gates.
-        Self::SafeCore
+    fn parse(contents: &str) -> Self {
+        contents
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                if key.trim() != "mode" {
+                    return None;
+                }
+
+                match value.trim() {
+                    "extended" => Some(Self::Extended),
+                    "safe-core" => Some(Self::SafeCore),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::SafeCore => "safe-core",
+            Self::Extended => "extended",
+        }
     }
 }
 
@@ -55,12 +74,12 @@ pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
 
-    // Extended remains locked for the v0.4 RC. Hover is independent and is
-    // deliberately opt-in because real COSMIC testing has shown hover-driven
-    // popup churn can restart cosmic-panel on some systems.
-    let _ = mode;
+    // Safe Core remains the default, while Extended is now a real persisted
+    // user preference. Optional preview/media subsystems still fall back to
+    // Safe Core behavior when they are unavailable or unhealthy.
     let contents = format!(
-        "mode=safe-core\nhover-popups={}\n",
+        "mode={}\nhover-popups={}\n",
+        mode.as_config_value(),
         if hover_popups { "true" } else { "false" }
     );
     fs::write(&temporary, contents)?;
@@ -97,15 +116,19 @@ mod tests {
     use super::{FeatureMode, parse_hover_popups};
 
     #[test]
-    fn all_persisted_modes_are_forced_to_safe_core() {
+    fn persisted_mode_defaults_to_safe_core_and_accepts_extended() {
         assert_eq!(FeatureMode::parse(""), FeatureMode::SafeCore);
         assert_eq!(FeatureMode::parse("mode=unknown\n"), FeatureMode::SafeCore);
-        assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::SafeCore);
+        assert_eq!(FeatureMode::parse("mode=safe-core\n"), FeatureMode::SafeCore);
+        assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::Extended);
     }
 
     #[test]
-    fn extended_request_is_not_effective_in_v04_rc() {
-        assert!(FeatureMode::Extended.safe_core());
+    fn feature_mode_reports_requested_safe_core_state() {
+        assert!(FeatureMode::SafeCore.safe_core());
+        assert!(!FeatureMode::Extended.safe_core());
+        assert_eq!(FeatureMode::SafeCore.as_config_value(), "safe-core");
+        assert_eq!(FeatureMode::Extended.as_config_value(), "extended");
     }
 
     #[test]
