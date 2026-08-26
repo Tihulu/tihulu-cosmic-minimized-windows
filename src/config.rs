@@ -136,7 +136,10 @@ mod tests {
     #[test]
     fn legacy_configs_migrate_to_extended() {
         assert_eq!(FeatureMode::parse(""), FeatureMode::Extended);
-        assert_eq!(FeatureMode::parse("mode=safe-core\n"), FeatureMode::Extended);
+        assert_eq!(
+            FeatureMode::parse("mode=safe-core\n"),
+            FeatureMode::Extended
+        );
         assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::Extended);
     }
 
