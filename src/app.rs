@@ -892,9 +892,7 @@ impl MinimizedWindows {
             cosmic::widget::text(preview_note)
                 .width(Length::Fill)
                 .into(),
-            cosmic::widget::text(reload_note)
-                .width(Length::Fill)
-                .into(),
+            cosmic::widget::text(reload_note).width(Length::Fill).into(),
         ])
         .spacing(10.0)
         .width(Length::Fill);
@@ -1190,7 +1188,8 @@ impl cosmic::Application for MinimizedWindows {
                     }
                     Err(error) => {
                         tracing::warn!(?error, "manual backend reload failed");
-                        self.backend_reload_status = Some(format!("Backend reload failed: {error}"));
+                        self.backend_reload_status =
+                            Some(format!("Backend reload failed: {error}"));
                     }
                 }
                 if self.preview_requested() {
