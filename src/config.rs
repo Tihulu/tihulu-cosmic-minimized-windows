@@ -40,6 +40,10 @@ pub(crate) fn load_hover_popups() -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn save_feature_mode(mode: FeatureMode) -> io::Result<()> {
+    save_settings(mode, load_hover_popups())
+}
+
 pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result<()> {
     let Some(path) = config_path() else {
         return Err(io::Error::new(
