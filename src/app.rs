@@ -599,6 +599,32 @@ impl MinimizedWindows {
                 button
             }
         };
+
+        let mut children: Vec<cosmic::Element<'a, Message>> = vec![
+            cosmic::widget::text(title).width(Length::Fill).into(),
+            cosmic::widget::text(detail).width(Length::Fill).into(),
+        ];
+
+        if let Some(length) = player.length_micros.filter(|length| *length > 0) {
+            let position = player.position_micros.clamp(0, length);
+            let progress = (position as f32 / length as f32).clamp(0.0, 1.0);
+            children.push(
+                cosmic::iced::widget::progress_bar(0.0..=1.0, progress)
+                    .length(Length::Fill)
+                    .girth(Length::Fixed(4.0))
+                    .into(),
+            );
+            children.push(
+                cosmic::widget::text(format!(
+                    "{} / {}",
+                    format_media_time(position),
+                    format_media_time(length)
+                ))
+                .width(Length::Fill)
+                .into(),
+            );
+        }
+
         let controls = cosmic::widget::row::with_children(vec![
             control("Previous", MediaAction::Previous, player.can_previous).into(),
             control(
@@ -611,16 +637,28 @@ impl MinimizedWindows {
         ])
         .spacing(6.0)
         .align_y(iced::Alignment::Center);
+        children.push(controls.into());
+
+        if let Some(volume) = player.volume {
+            let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u32;
+            let volume_controls = cosmic::widget::row::with_children(vec![
+                cosmic::widget::text(format!("Volume {percent}%"))
+                    .width(Length::Fill)
+                    .into(),
+                control("−", MediaAction::VolumeDown, true).into(),
+                control("+", MediaAction::VolumeUp, true).into(),
+            ])
+            .spacing(6.0)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
+            children.push(volume_controls.into());
+        }
 
         Some(
-            cosmic::widget::column::with_children(vec![
-                cosmic::widget::text(title).width(Length::Fill).into(),
-                cosmic::widget::text(detail).width(Length::Fill).into(),
-                controls.into(),
-            ])
-            .spacing(5.0)
-            .width(Length::Fill)
-            .into(),
+            cosmic::widget::column::with_children(children)
+                .spacing(5.0)
+                .width(Length::Fill)
+                .into(),
         )
     }
 
@@ -832,7 +870,23 @@ impl cosmic::Application for MinimizedWindows {
                     tracing::error!("Minimized-window Wayland bridge stopped");
                 }
                 BridgeEvent::Window(delta) => match *delta {
-                    WindowDelta::Present(info) => self.upsert(*info),
+                    WindowDelta::Present(info) => {
+                        let handle = info.foreign_toplevel.clone();
+                        let identifier = info.identifier.trim().to_owned();
+                        self.upsert(*info);
+                        if !identifier.is_empty()
+                            && self.preview_active()
+                            && self.popup.is_pinned()
+                            && let Some(group) = self
+                                .windows
+                                .iter()
+                                .find(|entry| entry.handle == handle)
+                                .map(|entry| entry.group_key.clone())
+                            && self.popup.active_group() == Some(group.as_str())
+                        {
+                            return self.capture_group_task(&group);
+                        }
+                    }
                     WindowDelta::Gone(handle) => {
                         let preview_was_requested = self.preview_requested();
                         let removed = self.remove(&handle);
@@ -1152,4 +1206,16 @@ fn normalize_identifier(input: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn format_media_time(micros: i64) -> String {
+    let seconds = (micros.max(0) / 1_000_000) as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
