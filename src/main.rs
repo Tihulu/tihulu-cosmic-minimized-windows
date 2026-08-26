@@ -2,6 +2,8 @@
 
 mod app;
 mod config;
+mod media_client;
+mod media_ipc;
 mod popup;
 mod preview_client;
 mod preview_ipc;
