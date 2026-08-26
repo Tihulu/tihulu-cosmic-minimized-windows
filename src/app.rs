@@ -577,9 +577,8 @@ impl MinimizedWindows {
                 }
             })
             .sum::<f32>();
-        let viewport_height = total_height
-            .min(POPUP_MAX_HEIGHT)
-            .max(COMPACT_ROW_HEIGHT_ESTIMATE);
+        let viewport_height =
+            total_height.clamp(COMPACT_ROW_HEIGHT_ESTIMATE, POPUP_MAX_HEIGHT);
         let list: cosmic::Element<_> = if total_height > POPUP_MAX_HEIGHT {
             cosmic::widget::scrollable::vertical(list)
                 .height(Length::Fixed(viewport_height))
@@ -674,10 +673,11 @@ impl MinimizedWindows {
         {
             return;
         }
-        if !self.previews.contains_key(&key) && self.previews.len() >= MAX_APPLET_PREVIEWS {
-            if let Some(victim) = self.previews.keys().next().cloned() {
-                self.previews.remove(&victim);
-            }
+        if !self.previews.contains_key(&key)
+            && self.previews.len() >= MAX_APPLET_PREVIEWS
+            && let Some(victim) = self.previews.keys().next().cloned()
+        {
+            self.previews.remove(&victim);
         }
         let handle = Handle::from_rgba(payload.width, payload.height, payload.rgba);
         self.previews.insert(
