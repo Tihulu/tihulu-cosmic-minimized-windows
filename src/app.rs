@@ -22,6 +22,8 @@ use cosmic::{
 
 use crate::{
     config::{self, FeatureMode, Settings},
+    media_client,
+    media_ipc::{MediaAction, MediaPlayerState},
     popup::{CloseGuard, CloseOutcome, OpenPlan, PopupFsm},
     preview_client::{self, PreviewPayload},
     wayland::{self, BridgeCommand, BridgeEvent, WindowDelta},
@@ -79,6 +81,7 @@ struct MinimizedWindows {
     previews: HashMap<String, PreviewEntry>,
     preview_healthy: bool,
     preview_health_generation: u64,
+    media_players: HashMap<String, MediaPlayerState>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +102,13 @@ enum Message {
     ToggleMedia(bool),
     TogglePreview(bool),
     ToggleHover(bool),
+    MediaLoaded(String, Result<Option<MediaPlayerState>, String>),
+    MediaControl {
+        group: String,
+        bus_name: String,
+        action: MediaAction,
+    },
+    MediaControlDone(String, Result<(), String>),
     PreviewLoaded(String, Result<PreviewPayload, String>),
     PreviewBatchLoaded(Vec<(String, Result<PreviewPayload, String>)>),
     PreviewHealthTick(u64),
@@ -193,6 +203,11 @@ impl MinimizedWindows {
         if let Some(identifier) = identifier.as_deref() {
             self.previews.remove(identifier);
         }
+        if let Some(group) = group.as_deref()
+            && self.group_count(group) == 0
+        {
+            self.media_players.remove(group);
+        }
         RemovedWindow { group, identifier }
     }
 
@@ -231,6 +246,10 @@ impl MinimizedWindows {
 
     fn preview_active(&self) -> bool {
         self.preview_requested() && self.preview_healthy
+    }
+
+    fn media_requested(&self) -> bool {
+        !self.settings.mode.safe_core() && self.settings.media_enabled
     }
 
     fn group_button<'a>(&self, entry: &'a Entry, count: usize) -> cosmic::Element<'a, Message> {
@@ -286,9 +305,6 @@ impl MinimizedWindows {
     }
 
     fn settings_button(&self) -> cosmic::Element<'_, Message> {
-        // Use the same non-symbolic icon size and padding as normal application
-        // icons such as Spotify. This makes the full-color Tihulu logo visually
-        // match neighboring app icons without requesting a thicker panel/dock.
         let handle = cosmic::widget::icon::from_name(APP_ID).handle();
         let size = self.core.applet.suggested_size(false);
         let (major, minor) = self.core.applet.suggested_padding(false);
@@ -377,11 +393,29 @@ impl MinimizedWindows {
         }
     }
 
+    fn media_status_task(group: String) -> Task<Message> {
+        let app_hint = group.clone();
+        Task::perform(media_client::status(app_hint), move |result| {
+            cosmic::Action::App(Message::MediaLoaded(group, result))
+        })
+    }
+
+    fn media_control_task(group: String, bus_name: String, action: MediaAction) -> Task<Message> {
+        Task::perform(media_client::control(bus_name, action), move |result| {
+            cosmic::Action::App(Message::MediaControlDone(group, result))
+        })
+    }
+
     fn open_group(&mut self, group: String, pinned: bool) -> Task<Message> {
         if self.group_count(&group) == 0 {
             return cosmic::task::none();
         }
-        self.request_popup(group, pinned)
+        let popup = self.request_popup(group.clone(), pinned);
+        if pinned && self.media_requested() {
+            Task::batch([popup, Self::media_status_task(group)])
+        } else {
+            popup
+        }
     }
 
     fn request_settings_open(&mut self) -> Task<Message> {
@@ -550,6 +584,59 @@ impl MinimizedWindows {
         }
     }
 
+    fn media_section<'a>(&'a self, group: &str) -> Option<cosmic::Element<'a, Message>> {
+        if !self.media_requested() {
+            return None;
+        }
+        let player = self.media_players.get(group)?;
+        let title = if player.title.trim().is_empty() {
+            player.identity.as_str()
+        } else {
+            player.title.as_str()
+        };
+        let detail = if player.artist.trim().is_empty() {
+            player.playback_status.clone()
+        } else {
+            format!("{} · {}", player.artist, player.playback_status)
+        };
+
+        let control = |label: &'static str, action: MediaAction, enabled: bool| {
+            let button = cosmic::widget::button::text(label);
+            if enabled {
+                button.on_press(Message::MediaControl {
+                    group: group.to_owned(),
+                    bus_name: player.bus_name.clone(),
+                    action,
+                })
+            } else {
+                button
+            }
+        };
+        let controls = cosmic::widget::row::with_children(vec![
+            control("Previous", MediaAction::Previous, player.can_previous).into(),
+            control(
+                "Play / Pause",
+                MediaAction::PlayPause,
+                player.can_play_pause,
+            )
+            .into(),
+            control("Next", MediaAction::Next, player.can_next).into(),
+        ])
+        .spacing(6.0)
+        .align_y(iced::Alignment::Center);
+
+        Some(
+            cosmic::widget::column::with_children(vec![
+                cosmic::widget::text(title).width(Length::Fill).into(),
+                cosmic::widget::text(detail).width(Length::Fill).into(),
+                controls.into(),
+            ])
+            .spacing(5.0)
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
     fn group_popup_view(&self) -> cosmic::Element<'_, Message> {
         let Some(group) = self.popup.active_group() else {
             return cosmic::widget::space::horizontal().into();
@@ -597,7 +684,12 @@ impl MinimizedWindows {
             list.into()
         };
 
-        let content = cosmic::widget::column::with_children(vec![header.into(), list])
+        let mut children: Vec<cosmic::Element<'_, Message>> = vec![header.into()];
+        if let Some(media) = self.media_section(group) {
+            children.push(media);
+        }
+        children.push(list);
+        let content = cosmic::widget::column::with_children(children)
             .spacing(9.0)
             .width(Length::Fill);
         let content = cosmic::widget::container(content)
@@ -632,10 +724,10 @@ impl MinimizedWindows {
         let mode_note = if self.settings.mode.safe_core() {
             "Safe Core is active. Media, Preview and Hover are off. Enabling any rich option exits Safe Core."
         } else {
-            "Safe Core is off. Preview uses the external daemon when healthy; unavailable windows keep the compact fallback."
+            "Safe Core is off. Rich features use external daemons and fall back independently when unavailable."
         };
         let media_note = if self.settings.media_enabled {
-            "Media backend: enabled preference · tihulu-mediad not connected yet"
+            "Media backend: enabled · tihulu-mediad is queried when a click popup opens"
         } else {
             "Media backend: disabled"
         };
@@ -872,6 +964,7 @@ impl cosmic::Application for MinimizedWindows {
                     self.settings.media_enabled = false;
                     self.settings.preview_enabled = false;
                     self.settings.hover_popups = false;
+                    self.media_players.clear();
                     self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
                     self.preview_healthy = false;
                     self.previews.clear();
@@ -890,6 +983,8 @@ impl cosmic::Application for MinimizedWindows {
                 self.settings.media_enabled = enabled;
                 if enabled {
                     self.settings.mode = FeatureMode::Extended;
+                } else {
+                    self.media_players.clear();
                 }
                 self.persist_settings();
             }
@@ -915,6 +1010,41 @@ impl cosmic::Application for MinimizedWindows {
                 self.persist_settings();
                 if !enabled && self.popup.is_hover_open() {
                     return self.close_popup();
+                }
+            }
+            Message::MediaLoaded(group, result) => {
+                if !self.media_requested() || self.group_count(&group) == 0 {
+                    self.media_players.remove(&group);
+                } else {
+                    match result {
+                        Ok(Some(player)) => {
+                            self.media_players.insert(group, player);
+                        }
+                        Ok(None) => {
+                            self.media_players.remove(&group);
+                        }
+                        Err(error) => {
+                            self.media_players.remove(&group);
+                            tracing::debug!(?error, "mediad unavailable; normal popup remains active");
+                        }
+                    }
+                }
+            }
+            Message::MediaControl {
+                group,
+                bus_name,
+                action,
+            } => {
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    return Self::media_control_task(group, bus_name, action);
+                }
+            }
+            Message::MediaControlDone(group, result) => {
+                if let Err(error) = result {
+                    tracing::warn!(?error, "MPRIS control failed");
+                }
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    return Self::media_status_task(group);
                 }
             }
             Message::PreviewLoaded(key, result) => match result {
