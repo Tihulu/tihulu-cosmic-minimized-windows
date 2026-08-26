@@ -109,7 +109,6 @@ enum Message {
         action: MediaAction,
     },
     MediaControlDone(String, Result<(), String>),
-    PreviewLoaded(String, Result<PreviewPayload, String>),
     PreviewBatchLoaded(Vec<(String, Result<PreviewPayload, String>)>),
     PreviewHealthTick(u64),
     PreviewHealthChecked(u64, Result<(), String>),
@@ -216,14 +215,6 @@ impl MinimizedWindows {
             .iter()
             .filter(|entry| entry.group_key == group)
             .count()
-    }
-
-    fn group_handles(&self, group: &str) -> Vec<ExtForeignToplevelHandleV1> {
-        self.windows
-            .iter()
-            .filter(|entry| entry.group_key == group)
-            .map(|entry| entry.handle.clone())
-            .collect()
     }
 
     fn group_index(&self, group: &str) -> u32 {
@@ -1020,10 +1011,6 @@ impl cosmic::Application for MinimizedWindows {
                     return Self::media_status_task(group);
                 }
             }
-            Message::PreviewLoaded(key, result) => match result {
-                Ok(payload) => self.accept_preview(key, payload),
-                Err(error) => self.preview_window_failed(&key, &error),
-            },
             Message::PreviewBatchLoaded(results) => {
                 for (key, result) in results {
                     match result {
