@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 mod app;
-mod media;
+mod config;
+mod media_client;
+mod media_ipc;
+mod popup;
+mod preview_client;
+mod preview_ipc;
 mod wayland;
 
 fn main() -> cosmic::iced::Result {

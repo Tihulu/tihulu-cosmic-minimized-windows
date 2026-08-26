@@ -1,28 +1,25 @@
 [package]
 name = "tihulu-cosmic-minimized-windows"
-version = "0.3.1"
+version = "0.4.0-rc.1"
 edition = "2024"
 rust-version = "1.93"
 license = "AGPL-3.0-only"
-description = "A stability-focused minimized windows applet for the COSMIC desktop."
+description = "A stability-first minimized windows applet for the COSMIC desktop."
 repository = "https://github.com/Tihulu/tihulu-cosmic-minimized-windows"
 
 [dependencies]
 cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "32283d7" }
 cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", default-features = false, features = ["client"], rev = "32283d7" }
 futures = "0.3"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "ef490df50b0a05a21c494c3f75737581bf0b39d9", default-features = false, features = ["applet", "applet-token", "dbus-config", "multi-window", "tokio", "wayland", "desktop-systemd-scope", "winit"] }
-memmap2 = "0.9"
-mpris2-zbus = { git = "https://github.com/pop-os/dbus-settings-bindings", package = "mpris2-zbus", rev = "eed01dd3609e90e3c8cd043656734c500956c793" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-zbus = { version = "5.15", default-features = false, features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [profile.release]
 opt-level = 3

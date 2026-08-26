@@ -2,9 +2,9 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+    time::Duration,
 };
 
 use cctk::toplevel_info::ToplevelInfo;
@@ -21,21 +21,28 @@ use cosmic::{
 };
 
 use crate::{
-    media::{self, MediaArtwork, MediaCommand, MediaSnapshot},
+    config::{self, FeatureMode, Settings},
+    media_client,
+    media_ipc::{MediaAction, MediaPlayerState},
+    popup::{CloseGuard, CloseOutcome, OpenPlan, PopupFsm},
+    preview_client::{self, PreviewPayload},
     wayland::{self, BridgeCommand, BridgeEvent, WindowDelta},
 };
 
 const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
-const HOVER_DELAY: Duration = Duration::from_millis(350);
-const LEAVE_GRACE: Duration = Duration::from_millis(500);
-const SINGLE_PREVIEW_WIDTH: f32 = 320.0;
-const SINGLE_PREVIEW_HEIGHT: f32 = 180.0;
-const GROUP_PREVIEW_WIDTH: f32 = 260.0;
-const GROUP_PREVIEW_HEIGHT: f32 = 146.0;
-const GROUP_COLUMNS: usize = 2;
-const GROUP_GRID_GAP: f32 = 12.0;
-const GROUP_MAX_VIEWPORT_HEIGHT: f32 = 520.0;
-const MAX_PREVIEW_IMAGES: usize = 8;
+const SETTINGS_GROUP: &str = "__tihulu_settings__";
+const LEAVE_GRACE: Duration = Duration::from_millis(650);
+const PREVIEW_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
+const MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(2500);
+const POPUP_WIDTH: f32 = 372.0;
+const POPUP_PADDING: f32 = 12.0;
+const POPUP_MAX_HEIGHT: f32 = 420.0;
+const COMPACT_ROW_HEIGHT_ESTIMATE: f32 = 52.0;
+const PREVIEW_ROW_HEIGHT_ESTIMATE: f32 = 224.0;
+const PREVIEW_WIDTH: f32 = 320.0;
+const PREVIEW_HEIGHT: f32 = 180.0;
+const MEDIA_ARTWORK_SIZE: f32 = 72.0;
+const MAX_APPLET_PREVIEWS: usize = 16;
 
 static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> =
     LazyLock::new(|| WidgetId::new("tihulu-minimized-windows-main"));
@@ -46,11 +53,22 @@ pub(crate) fn run() -> cosmic::iced::Result {
 
 struct Entry {
     handle: ExtForeignToplevelHandleV1,
+    identifier: String,
     group_key: String,
-    app_id: String,
     app_label: String,
     title: String,
     icon: fde::IconSource,
+}
+
+#[derive(Clone)]
+struct PreviewEntry {
+    generation: u64,
+    handle: Handle,
+}
+
+struct RemovedWindow {
+    group: Option<String>,
+    identifier: Option<String>,
 }
 
 #[derive(Default)]
@@ -60,31 +78,13 @@ struct MinimizedWindows {
     desktop_entries: Vec<fde::DesktopEntry>,
     windows: Vec<Entry>,
     command_tx: Option<calloop::channel::Sender<BridgeCommand>>,
-    hover_group: Option<String>,
-    active_group: Option<String>,
-    hover_epoch: u64,
-    close_epoch: u64,
-    popup_hovered: bool,
-    popup_pinned: bool,
-    preview_popup: Option<WindowId>,
-    preview_images: HashMap<ExtForeignToplevelHandleV1, Handle>,
-    preview_queue: VecDeque<ExtForeignToplevelHandleV1>,
-    preview_inflight: Option<ExtForeignToplevelHandleV1>,
-    media: Option<MediaSnapshot>,
-    media_loaded_at: Option<Instant>,
-    media_art_url: Option<String>,
-    media_art: Option<Handle>,
-    last_nonzero_volume: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum MediaUiAction {
-    Previous,
-    PlayPause,
-    Next,
-    VolumeDown,
-    Mute,
-    VolumeUp,
+    popup: PopupFsm,
+    settings: Settings,
+    previews: HashMap<String, PreviewEntry>,
+    preview_healthy: bool,
+    preview_health_generation: u64,
+    media_players: HashMap<String, MediaPlayerState>,
+    media_seek_drafts: HashMap<String, f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,18 +94,35 @@ enum Message {
     GroupOpen(String),
     GroupHoverEnter(String),
     GroupHoverExit(String),
-    HoverDelayElapsed(String, u64),
+    OpenSettings,
     PopupEnter,
     PopupExit,
-    CloseDelayElapsed(u64),
+    CloseDelayElapsed(CloseGuard),
     Restore(ExtForeignToplevelHandleV1),
     CloseWindow(ExtForeignToplevelHandleV1),
-    PreviewClosed(WindowId),
-    MediaLoaded(String, Option<Box<MediaSnapshot>>),
-    MediaArtworkLoaded(String, String, Option<Arc<MediaArtwork>>),
-    MediaControl(MediaUiAction),
-    RefreshMedia(String),
-    MediaTick,
+    PopupClosed(WindowId),
+    ToggleSafeCore(bool),
+    ToggleMedia(bool),
+    TogglePreview(bool),
+    ToggleHover(bool),
+    MediaLoaded(String, Result<Option<MediaPlayerState>, String>),
+    MediaControl {
+        group: String,
+        bus_name: String,
+        action: MediaAction,
+    },
+    MediaControlDone(String, Result<(), String>),
+    MediaSeekChanged {
+        group: String,
+        fraction: f32,
+    },
+    MediaSeekDone(String, Result<(), String>),
+    MediaRefreshTick,
+    PreviewBatchLoaded(Vec<(String, Result<PreviewPayload, String>)>),
+    PreviewHealthTick(u64),
+    PreviewHealthChecked(u64, Result<(), String>),
+    PreviewMaintenanceDone,
+    Surface(cosmic::surface::Action),
 }
 
 impl MinimizedWindows {
@@ -149,6 +166,7 @@ impl MinimizedWindows {
 
     fn upsert(&mut self, info: ToplevelInfo) {
         let handle = info.foreign_toplevel.clone();
+        let identifier = info.identifier.trim().to_owned();
         let app_id = info.app_id.trim().to_owned();
         let (app_label, icon, group_key) = self.app_visuals(&app_id);
         let title = if info.title.trim().is_empty() {
@@ -159,8 +177,8 @@ impl MinimizedWindows {
 
         let entry = Entry {
             handle: handle.clone(),
+            identifier,
             group_key,
-            app_id,
             app_label,
             title,
             icon,
@@ -177,18 +195,29 @@ impl MinimizedWindows {
         }
     }
 
-    fn remove(&mut self, handle: &ExtForeignToplevelHandleV1) -> Option<String> {
+    fn remove(&mut self, handle: &ExtForeignToplevelHandleV1) -> RemovedWindow {
         let group = self
             .windows
             .iter()
             .find(|entry| &entry.handle == handle)
             .map(|entry| entry.group_key.clone());
+        let identifier = self
+            .windows
+            .iter()
+            .find(|entry| &entry.handle == handle)
+            .map(|entry| entry.identifier.clone())
+            .filter(|identifier| !identifier.is_empty());
         self.windows.retain(|window| &window.handle != handle);
-        group
-    }
-
-    fn group_entry(&self, group: &str) -> Option<&Entry> {
-        self.windows.iter().find(|entry| entry.group_key == group)
+        if let Some(identifier) = identifier.as_deref() {
+            self.previews.remove(identifier);
+        }
+        if let Some(group) = group.as_deref()
+            && self.group_count(group) == 0
+        {
+            self.media_players.remove(group);
+            self.media_seek_drafts.remove(group);
+        }
+        RemovedWindow { group, identifier }
     }
 
     fn group_count(&self, group: &str) -> usize {
@@ -196,85 +225,6 @@ impl MinimizedWindows {
             .iter()
             .filter(|entry| entry.group_key == group)
             .count()
-    }
-
-    fn group_handles(&self, group: &str) -> Vec<ExtForeignToplevelHandleV1> {
-        self.windows
-            .iter()
-            .filter(|entry| entry.group_key == group)
-            .map(|entry| entry.handle.clone())
-            .collect()
-    }
-
-    fn group_titles(&self, group: &str) -> Vec<String> {
-        self.windows
-            .iter()
-            .filter(|entry| entry.group_key == group)
-            .map(|entry| entry.title.clone())
-            .collect()
-    }
-
-    fn group_contains_handle(&self, group: &str, handle: &ExtForeignToplevelHandleV1) -> bool {
-        self.windows
-            .iter()
-            .any(|entry| entry.group_key == group && &entry.handle == handle)
-    }
-
-    fn group_button<'a>(&self, entry: &'a Entry, _count: usize) -> cosmic::Element<'a, Message> {
-        let icon = entry.icon.as_cosmic_icon();
-        let symbolic = icon.symbolic;
-        let size = self.core.applet.suggested_size(symbolic);
-        let (major, minor) = self.core.applet.suggested_padding(symbolic);
-        let (px, py) = if self.core.applet.is_horizontal() {
-            (major, minor)
-        } else {
-            (minor, major)
-        };
-        let group = entry.group_key.clone();
-
-        let button = cosmic::widget::button::custom(
-            cosmic::widget::icon(icon)
-                .width(Length::Fixed(size.0 as f32))
-                .height(Length::Fixed(size.1 as f32)),
-        )
-        .class(cosmic::theme::Button::AppletIcon)
-        .padding([py as f32, px as f32])
-        .on_press_down(Message::GroupPrimary(group.clone()));
-
-        // Tooltips create a second hover surface and can generate enter/leave churn
-        // while the delayed preview is being armed. Keep one pointer surface per icon.
-        cosmic::widget::mouse_area(button)
-            .on_enter(Message::GroupHoverEnter(group.clone()))
-            .on_exit(Message::GroupHoverExit(group.clone()))
-            .on_right_press(Message::GroupOpen(group))
-            .into()
-    }
-
-    fn reset_popup_payload(&mut self) {
-        self.preview_images.clear();
-        self.preview_queue.clear();
-        self.preview_inflight = None;
-        self.media = None;
-        self.media_loaded_at = None;
-        self.media_art_url = None;
-        self.media_art = None;
-    }
-
-    fn clear_popup_state(&mut self) {
-        self.reset_popup_payload();
-        self.active_group = None;
-        self.popup_hovered = false;
-        self.popup_pinned = false;
-    }
-
-    fn close_preview_surface(&mut self) -> Task<Message> {
-        self.clear_popup_state();
-        let Some(id) = self.preview_popup.take() else {
-            return cosmic::task::none();
-        };
-
-        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
-        destroy_popup(id)
     }
 
     fn group_index(&self, group: &str) -> u32 {
@@ -291,7 +241,100 @@ impl MinimizedWindows {
         index
     }
 
-    fn preview_anchor_rect(&self, group: &str) -> iced::Rectangle<i32> {
+    fn preview_requested(&self) -> bool {
+        !self.settings.mode.safe_core() && self.settings.preview_enabled
+    }
+
+    fn preview_active(&self) -> bool {
+        self.preview_requested() && self.preview_healthy
+    }
+
+    fn media_requested(&self) -> bool {
+        !self.settings.mode.safe_core() && self.settings.media_enabled
+    }
+
+    fn group_button<'a>(&self, entry: &'a Entry, count: usize) -> cosmic::Element<'a, Message> {
+        let icon = entry.icon.as_cosmic_icon();
+        let symbolic = icon.symbolic;
+        let size = self.core.applet.suggested_size(symbolic);
+        let (major, minor) = self.core.applet.suggested_padding(symbolic);
+        let (px, py) = if self.core.applet.is_horizontal() {
+            (major, minor)
+        } else {
+            (minor, major)
+        };
+        let group = entry.group_key.clone();
+
+        let mut content: Vec<cosmic::Element<'a, Message>> = vec![
+            cosmic::widget::icon(icon)
+                .width(Length::Fixed(size.0 as f32))
+                .height(Length::Fixed(size.1 as f32))
+                .into(),
+        ];
+        if count > 1 {
+            content.push(cosmic::widget::text(count.to_string()).into());
+        }
+
+        let button = cosmic::widget::button::custom(
+            cosmic::widget::row::with_children(content)
+                .spacing(2.0)
+                .align_y(iced::Alignment::Center),
+        )
+        .class(cosmic::theme::Button::AppletIcon)
+        .padding([py as f32, px as f32])
+        .on_press_down(Message::GroupPrimary(group.clone()));
+
+        let area =
+            cosmic::widget::mouse_area(button).on_right_press(Message::GroupOpen(group.clone()));
+        if self.settings.hover_popups {
+            area.on_enter(Message::GroupHoverEnter(group.clone()))
+                .on_exit(Message::GroupHoverExit(group))
+                .into()
+        } else {
+            let tooltip = self
+                .windows
+                .iter()
+                .filter(|window| window.group_key == group)
+                .map(|window| window.title.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.core
+                .applet
+                .applet_tooltip(area, tooltip, self.popup.is_open(), Message::Surface, None)
+                .into()
+        }
+    }
+
+    fn settings_button(&self) -> cosmic::Element<'_, Message> {
+        let handle = cosmic::widget::icon::from_name(APP_ID).handle();
+        let size = self.core.applet.suggested_size(false);
+        let (major, minor) = self.core.applet.suggested_padding(false);
+        let (px, py) = if self.core.applet.is_horizontal() {
+            (major, minor)
+        } else {
+            (minor, major)
+        };
+        let logo = cosmic::widget::icon(handle)
+            .width(Length::Fixed(size.0 as f32))
+            .height(Length::Fixed(size.1 as f32));
+        let button = cosmic::widget::button::custom(logo)
+            .class(cosmic::theme::Button::AppletIcon)
+            .padding([py as f32, px as f32])
+            .on_press_down(Message::OpenSettings);
+
+        self.core
+            .applet
+            .applet_tooltip(
+                button,
+                "Tihulu Minimizer Settings",
+                self.popup.is_open(),
+                Message::Surface,
+                None,
+            )
+            .into()
+    }
+
+    fn popup_anchor_rect(&self, group: &str) -> iced::Rectangle<i32> {
         let index = self.group_index(group);
         let (icon_width, icon_height) = self.core.applet.suggested_size(false);
         let (major, minor) = self.core.applet.suggested_padding(false);
@@ -326,12 +369,8 @@ impl MinimizedWindows {
         }
     }
 
-    fn open_preview_surface(&mut self, group: &str) -> Task<Message> {
-        use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
-
-        let previous = self.preview_popup.take();
-        let id = WindowId::unique();
-        self.preview_popup = Some(id);
+    fn popup_task(&self, group: &str, id: WindowId) -> Task<Message> {
+        use cosmic::iced::platform_specific::shell::commands::popup::get_popup;
 
         let mut settings = self.core.applet.get_popup_settings(
             self.core.main_window_id().unwrap(),
@@ -340,323 +379,371 @@ impl MinimizedWindows {
             None,
             None,
         );
-        settings.positioner.anchor_rect = self.preview_anchor_rect(group);
-        let open = get_popup(settings);
+        settings.positioner.anchor_rect = self.popup_anchor_rect(group);
+        get_popup(settings)
+    }
 
-        if let Some(previous) = previous {
-            Task::batch([destroy_popup(previous), open])
-        } else {
-            open
+    fn request_popup(&mut self, group: String, pinned: bool) -> Task<Message> {
+        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
+
+        let proposed_id = WindowId::unique();
+        match self.popup.request_open(group, pinned, proposed_id) {
+            OpenPlan::None => cosmic::task::none(),
+            OpenPlan::Create { window_id, group } => self.popup_task(&group, window_id),
+            OpenPlan::CloseForSwitch { old_window_id } => destroy_popup(old_window_id),
         }
     }
 
-    fn hover_delay_task(group: String, epoch: u64) -> Task<Message> {
-        Task::perform(
-            async move {
-                tokio::time::sleep(HOVER_DELAY).await;
-                (group, epoch)
-            },
-            |(group, epoch)| cosmic::Action::App(Message::HoverDelayElapsed(group, epoch)),
-        )
-    }
-
-    fn close_delay_task(epoch: u64) -> Task<Message> {
-        Task::perform(
-            async move {
-                tokio::time::sleep(LEAVE_GRACE).await;
-                epoch
-            },
-            |epoch| cosmic::Action::App(Message::CloseDelayElapsed(epoch)),
-        )
-    }
-
-    fn load_media_task(&self, group: &str) -> Task<Message> {
-        let Some(entry) = self.group_entry(group) else {
-            return cosmic::task::none();
-        };
-        let app_id = entry.app_id.clone();
-        let app_label = entry.app_label.clone();
-        let titles = self.group_titles(group);
-        let group = group.to_owned();
-
-        Task::perform(
-            media::snapshot(app_id, app_label, titles),
-            move |snapshot| {
-                cosmic::Action::App(Message::MediaLoaded(group, snapshot.map(Box::new)))
-            },
-        )
-    }
-
-    fn load_art_task(group: String, url: String) -> Task<Message> {
-        let request_url = url.clone();
-        Task::perform(media::load_art(request_url), move |artwork| {
-            cosmic::Action::App(Message::MediaArtworkLoaded(
-                group,
-                url,
-                artwork.map(Arc::new),
-            ))
+    fn media_status_task(group: String) -> Task<Message> {
+        let app_hint = group.clone();
+        Task::perform(media_client::status(app_hint), move |result| {
+            cosmic::Action::App(Message::MediaLoaded(group, result))
         })
     }
 
-    fn request_next_preview(&mut self) {
-        if self.preview_inflight.is_some() {
-            return;
-        }
-        let Some(group) = self.active_group.clone() else {
-            return;
-        };
-        let Some(tx) = self.command_tx.clone() else {
-            return;
-        };
-
-        while let Some(handle) = self.preview_queue.pop_front() {
-            if !self.group_contains_handle(&group, &handle) {
-                continue;
-            }
-            self.preview_inflight = Some(handle.clone());
-            if tx.send(BridgeCommand::CapturePreview(handle)).is_ok() {
-                break;
-            }
-            self.preview_inflight = None;
-        }
+    fn media_control_task(group: String, bus_name: String, action: MediaAction) -> Task<Message> {
+        Task::perform(media_client::control(bus_name, action), move |result| {
+            cosmic::Action::App(Message::MediaControlDone(group, result))
+        })
     }
 
-    fn start_preview_sequence(&mut self, group: &str) {
-        self.preview_images.clear();
-        self.preview_queue = self
-            .group_handles(group)
-            .into_iter()
-            .take(MAX_PREVIEW_IMAGES)
-            .collect();
-        self.preview_inflight = None;
-        self.request_next_preview();
-    }
-
-    fn refresh_open_group(&mut self, group: &str) -> Task<Message> {
-        self.start_preview_sequence(group);
-        self.load_media_task(group)
+    fn media_seek_task(
+        group: String,
+        bus_name: String,
+        track_id: String,
+        position_micros: i64,
+    ) -> Task<Message> {
+        Task::perform(
+            media_client::seek(bus_name, track_id, position_micros),
+            move |result| cosmic::Action::App(Message::MediaSeekDone(group, result)),
+        )
     }
 
     fn open_group(&mut self, group: String, pinned: bool) -> Task<Message> {
-        if self.active_group.as_deref() == Some(group.as_str()) && self.preview_popup.is_some() {
-            self.popup_pinned |= pinned;
-            return self.refresh_open_group(&group);
+        if self.group_count(&group) == 0 {
+            return cosmic::task::none();
         }
 
-        self.reset_popup_payload();
-        self.active_group = Some(group.clone());
-        self.popup_pinned = pinned;
-        self.popup_hovered = false;
+        let mut tasks = vec![self.request_popup(group.clone(), pinned)];
+        if pinned && self.media_requested() {
+            tasks.push(Self::media_status_task(group.clone()));
+        }
+        if pinned && self.preview_active() {
+            tasks.push(self.capture_group_task(&group));
+        }
+        Task::batch(tasks)
+    }
 
-        let popup = self.open_preview_surface(&group);
-        self.start_preview_sequence(&group);
-        let media = self.load_media_task(&group);
-        Task::batch([popup, media])
+    fn request_settings_open(&mut self) -> Task<Message> {
+        self.request_popup(SETTINGS_GROUP.to_owned(), true)
+    }
+
+    fn toggle_settings_popup(&mut self) -> Task<Message> {
+        if self.popup.active_group() == Some(SETTINGS_GROUP) {
+            self.close_popup()
+        } else {
+            self.request_settings_open()
+        }
+    }
+
+    fn close_popup(&mut self) -> Task<Message> {
+        use cosmic::iced::platform_specific::shell::commands::popup::destroy_popup;
+
+        self.popup
+            .close_current()
+            .map(destroy_popup)
+            .unwrap_or_else(cosmic::task::none)
     }
 
     fn schedule_close(&mut self) -> Task<Message> {
-        self.close_epoch = self.close_epoch.wrapping_add(1);
-        Self::close_delay_task(self.close_epoch)
-    }
-
-    fn preview_dimensions(count: usize) -> (f32, f32, usize) {
-        if count <= 1 {
-            (SINGLE_PREVIEW_WIDTH, SINGLE_PREVIEW_HEIGHT, 1)
-        } else {
-            (GROUP_PREVIEW_WIDTH, GROUP_PREVIEW_HEIGHT, GROUP_COLUMNS)
-        }
-    }
-
-    fn preview_visual<'a>(
-        &self,
-        entry: &'a Entry,
-        width: f32,
-        height: f32,
-    ) -> cosmic::Element<'a, Message> {
-        if let Some(handle) = self.preview_images.get(&entry.handle) {
-            Image::new(handle.clone())
-                .width(Length::Fixed(width))
-                .height(Length::Fixed(height))
-                .content_fit(iced::ContentFit::Contain)
-                .into()
-        } else {
-            let icon = entry.icon.as_cosmic_icon();
-            cosmic::widget::container(
-                cosmic::widget::icon(icon)
-                    .width(Length::Fixed(72.0))
-                    .height(Length::Fixed(72.0)),
-            )
-            .center_x(Length::Fixed(width))
-            .center_y(Length::Fixed(height))
-            .into()
-        }
-    }
-
-    fn window_preview_card<'a>(
-        &self,
-        entry: &'a Entry,
-        width: f32,
-        height: f32,
-    ) -> cosmic::Element<'a, Message> {
-        let visual = self.preview_visual(entry, width, height);
-        let image_button = cosmic::widget::button::custom_image_button(
-            visual,
-            Some(Message::CloseWindow(entry.handle.clone())),
+        let Some(guard) = self.popup.schedule_close() else {
+            return cosmic::task::none();
+        };
+        Task::perform(
+            async move {
+                tokio::time::sleep(LEAVE_GRACE).await;
+                guard
+            },
+            |guard| cosmic::Action::App(Message::CloseDelayElapsed(guard)),
         )
-        .padding(0)
+    }
+
+    fn persist_settings(&self) {
+        if let Err(error) = config::save_settings(self.settings) {
+            tracing::warn!(?error, "Could not persist applet settings");
+        }
+    }
+
+    fn capture_group_task(&self, group: &str) -> Task<Message> {
+        let requests = self
+            .windows
+            .iter()
+            .filter(|entry| entry.group_key == group)
+            .filter(|entry| !entry.identifier.is_empty())
+            .filter(|entry| !self.previews.contains_key(&entry.identifier))
+            .take(MAX_APPLET_PREVIEWS)
+            .map(|entry| (entry.identifier.clone(), entry.identifier.clone()))
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return cosmic::task::none();
+        }
+        Task::perform(preview_client::capture_many(requests), |results| {
+            cosmic::Action::App(Message::PreviewBatchLoaded(results))
+        })
+    }
+
+    fn health_delay_task(generation: u64) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::time::sleep(PREVIEW_HEALTH_INTERVAL).await;
+                generation
+            },
+            |generation| cosmic::Action::App(Message::PreviewHealthTick(generation)),
+        )
+    }
+
+    fn health_check_task(generation: u64) -> Task<Message> {
+        Task::perform(preview_client::health(), move |result| {
+            cosmic::Action::App(Message::PreviewHealthChecked(generation, result))
+        })
+    }
+
+    fn clear_preview_task() -> Task<Message> {
+        Task::perform(preview_client::clear(), |_| {
+            cosmic::Action::App(Message::PreviewMaintenanceDone)
+        })
+    }
+
+    fn gone_task(identifier: Option<String>) -> Task<Message> {
+        let Some(identifier) = identifier else {
+            return cosmic::task::none();
+        };
+        Task::perform(preview_client::gone(identifier), |_| {
+            cosmic::Action::App(Message::PreviewMaintenanceDone)
+        })
+    }
+
+    fn compact_window_row<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
+        let icon = cosmic::widget::icon(entry.icon.as_cosmic_icon())
+            .width(Length::Fixed(36.0))
+            .height(Length::Fixed(36.0));
+        let label = cosmic::widget::text(&entry.title).width(Length::Fill);
+        let restore = cosmic::widget::button::custom(
+            cosmic::widget::row::with_children(vec![icon.into(), label.into()])
+                .spacing(9.0)
+                .align_y(iced::Alignment::Center)
+                .width(Length::Fill),
+        )
+        .width(Length::Fill)
         .on_press(Message::Restore(entry.handle.clone()));
+        let close =
+            cosmic::widget::button::text("×").on_press(Message::CloseWindow(entry.handle.clone()));
 
-        cosmic::widget::column::with_children(vec![
-            image_button.into(),
-            cosmic::widget::text(&entry.title).into(),
-        ])
-        .spacing(5.0)
-        .width(Length::Fixed(width))
-        .into()
-    }
-
-    fn media_progress(&self, media: &MediaSnapshot) -> (f32, i64) {
-        if media.length_us <= 0 {
-            return (0.0, media.position_us.max(0));
-        }
-
-        let elapsed = if media.playing {
-            self.media_loaded_at
-                .map(|loaded| loaded.elapsed().as_micros())
-                .and_then(|micros| i64::try_from(micros).ok())
-                .unwrap_or_default()
-        } else {
-            0
-        };
-        let position = media
-            .position_us
-            .saturating_add(elapsed)
-            .clamp(0, media.length_us);
-        (
-            (position as f64 / media.length_us as f64).clamp(0.0, 1.0) as f32,
-            position,
-        )
-    }
-
-    fn media_card(&self) -> Option<cosmic::Element<'_, Message>> {
-        let media = self.media.as_ref()?;
-        let (progress, position) = self.media_progress(media);
-
-        let artwork: cosmic::Element<_> = if let Some(handle) = &self.media_art {
-            Image::new(handle.clone())
-                .width(Length::Fixed(112.0))
-                .height(Length::Fixed(112.0))
-                .content_fit(iced::ContentFit::Cover)
-                .into()
-        } else if let Some(entry) = self
-            .active_group
-            .as_deref()
-            .and_then(|group| self.group_entry(group))
-        {
-            cosmic::widget::container(
-                cosmic::widget::icon(entry.icon.as_cosmic_icon())
-                    .width(Length::Fixed(64.0))
-                    .height(Length::Fixed(64.0)),
-            )
-            .center_x(Length::Fixed(112.0))
-            .center_y(Length::Fixed(112.0))
+        cosmic::widget::row::with_children(vec![restore.into(), close.into()])
+            .spacing(6.0)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill)
             .into()
+    }
+
+    fn preview_window_row<'a>(
+        &self,
+        entry: &'a Entry,
+        preview: &PreviewEntry,
+    ) -> cosmic::Element<'a, Message> {
+        let image = Image::new(preview.handle.clone())
+            .width(Length::Fixed(PREVIEW_WIDTH))
+            .height(Length::Fixed(PREVIEW_HEIGHT))
+            .content_fit(iced::ContentFit::Contain);
+        let restore = cosmic::widget::button::custom(image)
+            .padding(0)
+            .on_press(Message::Restore(entry.handle.clone()));
+        let footer = cosmic::widget::row::with_children(vec![
+            cosmic::widget::text(&entry.title)
+                .width(Length::Fill)
+                .into(),
+            cosmic::widget::button::text("×")
+                .on_press(Message::CloseWindow(entry.handle.clone()))
+                .into(),
+        ])
+        .spacing(6.0)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill);
+
+        cosmic::widget::column::with_children(vec![restore.into(), footer.into()])
+            .spacing(5.0)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn preview_for(&self, entry: &Entry) -> Option<&PreviewEntry> {
+        if !self.popup.is_pinned() {
+            return None;
+        }
+        self.preview_active()
+            .then(|| self.previews.get(&entry.identifier))
+            .flatten()
+    }
+
+    fn window_row<'a>(&self, entry: &'a Entry) -> cosmic::Element<'a, Message> {
+        if let Some(preview) = self.preview_for(entry) {
+            self.preview_window_row(entry, preview)
         } else {
-            cosmic::widget::space::horizontal()
-                .width(Length::Fixed(112.0))
-                .height(Length::Fixed(112.0))
-                .into()
+            self.compact_window_row(entry)
+        }
+    }
+
+    fn media_section<'a>(&'a self, group: &str) -> Option<cosmic::Element<'a, Message>> {
+        if !self.popup.is_pinned() || !self.media_requested() {
+            return None;
+        }
+        let player = self.media_players.get(group)?;
+        let title = if player.title.trim().is_empty() {
+            player.identity.as_str()
+        } else {
+            player.title.as_str()
+        };
+        let detail = if player.artist.trim().is_empty() {
+            player.playback_status.clone()
+        } else {
+            format!("{} · {}", player.artist, player.playback_status)
         };
 
-        let identity = cosmic::widget::text(&media.identity);
-        let title = cosmic::widget::text(&media.title);
-        let artists = cosmic::widget::text(&media.artists);
-        let info = cosmic::widget::column::with_children(vec![
-            identity.into(),
-            title.into(),
-            artists.into(),
+        let control = |label: &'static str, action: MediaAction, enabled: bool| {
+            let button = cosmic::widget::button::text(label);
+            if enabled {
+                button.on_press(Message::MediaControl {
+                    group: group.to_owned(),
+                    bus_name: player.bus_name.clone(),
+                    action,
+                })
+            } else {
+                button
+            }
+        };
+
+        let text_block = cosmic::widget::column::with_children(vec![
+            cosmic::widget::text(title).width(Length::Fill).into(),
+            cosmic::widget::text(detail).width(Length::Fill).into(),
         ])
         .spacing(4.0)
         .width(Length::Fill);
 
-        let top = cosmic::widget::row::with_children(vec![artwork, info.into()])
-            .spacing(12.0)
-            .align_y(iced::Alignment::Center);
-
-        let previous = cosmic::widget::button::text("⏮").on_press_maybe(
-            media
-                .can_previous
-                .then_some(Message::MediaControl(MediaUiAction::Previous)),
-        );
-        let play_pause = cosmic::widget::button::text(if media.playing { "⏸" } else { "▶" })
-            .on_press_maybe(
-                media
-                    .can_play_pause
-                    .then_some(Message::MediaControl(MediaUiAction::PlayPause)),
+        let mut children: Vec<cosmic::Element<'a, Message>> = Vec::new();
+        if let Some(path) = player.artwork_path.as_deref() {
+            let artwork = Image::new(Handle::from_path(path))
+                .width(Length::Fixed(MEDIA_ARTWORK_SIZE))
+                .height(Length::Fixed(MEDIA_ARTWORK_SIZE))
+                .content_fit(iced::ContentFit::Cover);
+            children.push(
+                cosmic::widget::row::with_children(vec![artwork.into(), text_block.into()])
+                    .spacing(10.0)
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
             );
-        let next = cosmic::widget::button::text("⏭").on_press_maybe(
-            media
-                .can_next
-                .then_some(Message::MediaControl(MediaUiAction::Next)),
-        );
-        let controls = cosmic::widget::row::with_children(vec![
-            previous.into(),
-            play_pause.into(),
-            next.into(),
-        ])
-        .spacing(8.0)
-        .align_y(iced::Alignment::Center);
+        } else {
+            children.push(text_block.into());
+        }
 
-        let progress_bar = cosmic::iced::widget::progress_bar(0.0..=1.0, progress)
-            .length(Length::Fill)
-            .girth(Length::Fixed(4.0));
-        let times = cosmic::widget::row::with_children(vec![
-            cosmic::widget::text(format_time(position)).into(),
-            cosmic::widget::space::horizontal()
+        if let Some(length) = player.length_micros.filter(|length| *length > 0) {
+            let position = player.position_micros.clamp(0, length);
+            let current_fraction = (position as f32 / length as f32).clamp(0.0, 1.0);
+            let display_fraction = self
+                .media_seek_drafts
+                .get(group)
+                .copied()
+                .unwrap_or(current_fraction)
+                .clamp(0.0, 1.0);
+            let display_position =
+                ((display_fraction as f64 * length as f64).round() as i64).clamp(0, length);
+
+            children.push(
+                cosmic::iced::widget::progress_bar(0.0..=1.0, display_fraction)
+                    .length(Length::Fill)
+                    .girth(Length::Fixed(4.0))
+                    .into(),
+            );
+
+            let mut timeline: Vec<cosmic::Element<'a, Message>> = vec![
+                cosmic::widget::text(format!(
+                    "{} / {}",
+                    format_media_time(display_position),
+                    format_media_time(length)
+                ))
                 .width(Length::Fill)
                 .into(),
-            cosmic::widget::text(format_time(media.length_us)).into(),
-        ]);
+            ];
+            if player.can_seek && player.track_id.is_some() {
+                let back_position = display_position.saturating_sub(10_000_000);
+                let forward_position = display_position.saturating_add(10_000_000).min(length);
+                let back_fraction = (back_position as f32 / length as f32).clamp(0.0, 1.0);
+                let forward_fraction = (forward_position as f32 / length as f32).clamp(0.0, 1.0);
+                timeline.push(
+                    cosmic::widget::button::text("−10s")
+                        .on_press(Message::MediaSeekChanged {
+                            group: group.to_owned(),
+                            fraction: back_fraction,
+                        })
+                        .into(),
+                );
+                timeline.push(
+                    cosmic::widget::button::text("+10s")
+                        .on_press(Message::MediaSeekChanged {
+                            group: group.to_owned(),
+                            fraction: forward_fraction,
+                        })
+                        .into(),
+                );
+            }
+            children.push(
+                cosmic::widget::row::with_children(timeline)
+                    .spacing(6.0)
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
 
-        let display_volume = if media.muted { 0.0 } else { media.volume };
-        let volume_down = cosmic::widget::button::text("−")
-            .on_press(Message::MediaControl(MediaUiAction::VolumeDown));
-        let mute = cosmic::widget::button::text(if media.muted || media.volume <= 0.01 {
-            "🔈"
-        } else {
-            "🔇"
-        })
-        .on_press(Message::MediaControl(MediaUiAction::Mute));
-        let volume_up = cosmic::widget::button::text("+")
-            .on_press(Message::MediaControl(MediaUiAction::VolumeUp));
-        let volume_bar = cosmic::iced::widget::progress_bar(0.0..=1.5, display_volume as f32)
-            .length(Length::Fixed(120.0))
-            .girth(Length::Fixed(4.0));
-        let volume = cosmic::widget::row::with_children(vec![
-            volume_down.into(),
-            mute.into(),
-            volume_bar.into(),
-            volume_up.into(),
+        let controls = cosmic::widget::row::with_children(vec![
+            control("Previous", MediaAction::Previous, player.can_previous).into(),
+            control(
+                "Play / Pause",
+                MediaAction::PlayPause,
+                player.can_play_pause,
+            )
+            .into(),
+            control("Next", MediaAction::Next, player.can_next).into(),
         ])
         .spacing(6.0)
         .align_y(iced::Alignment::Center);
+        children.push(controls.into());
+
+        if let Some(volume) = player.volume {
+            let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u32;
+            let volume_controls = cosmic::widget::row::with_children(vec![
+                cosmic::widget::text(format!("Volume {percent}%"))
+                    .width(Length::Fill)
+                    .into(),
+                control("−", MediaAction::VolumeDown, true).into(),
+                control("+", MediaAction::VolumeUp, true).into(),
+            ])
+            .spacing(6.0)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
+            children.push(volume_controls.into());
+        }
 
         Some(
-            cosmic::widget::column::with_children(vec![
-                top.into(),
-                controls.into(),
-                progress_bar.into(),
-                times.into(),
-                volume.into(),
-            ])
-            .spacing(7.0)
-            .width(Length::Fill)
-            .into(),
+            cosmic::widget::column::with_children(children)
+                .spacing(5.0)
+                .width(Length::Fill)
+                .into(),
         )
     }
 
-    fn group_preview(&self) -> cosmic::Element<'_, Message> {
-        let Some(group) = self.active_group.as_deref() else {
+    fn group_popup_view(&self) -> cosmic::Element<'_, Message> {
+        let Some(group) = self.popup.active_group() else {
             return cosmic::widget::space::horizontal().into();
         };
         let entries = self
@@ -668,68 +755,153 @@ impl MinimizedWindows {
             return cosmic::widget::space::horizontal().into();
         }
 
-        let mut children: Vec<cosmic::Element<'_, Message>> = Vec::new();
-        children.push(
-            cosmic::widget::text(format!(
-                "{} — {} minimized window{}",
-                entries[0].app_label,
-                entries.len(),
-                if entries.len() == 1 { "" } else { "s" }
-            ))
-            .into(),
-        );
+        let header = cosmic::widget::text(format!(
+            "{} — {} minimized window{}",
+            entries[0].app_label,
+            entries.len(),
+            if entries.len() == 1 { "" } else { "s" }
+        ));
 
-        if let Some(media) = self.media_card() {
-            children.push(media);
-        }
-
-        let (preview_width, preview_height, columns) = Self::preview_dimensions(entries.len());
-        let grid_width =
-            preview_width * columns as f32 + GROUP_GRID_GAP * columns.saturating_sub(1) as f32;
-        let rows = entries.len().div_ceil(columns);
-        let estimated_card_height = preview_height + 42.0;
-        let estimated_grid_height =
-            estimated_card_height * rows as f32 + GROUP_GRID_GAP * rows.saturating_sub(1) as f32;
-        let viewport_height = estimated_grid_height.clamp(1.0, GROUP_MAX_VIEWPORT_HEIGHT);
-
-        let mut grid = cosmic::widget::grid::grid()
-            .column_spacing(GROUP_GRID_GAP as u16)
-            .row_spacing(GROUP_GRID_GAP as u16)
-            .max_width(grid_width);
-        for (index, entry) in entries.iter().enumerate() {
-            grid = grid.push(self.window_preview_card(entry, preview_width, preview_height));
-            if (index + 1) % columns == 0 {
-                grid = grid.insert_row();
-            }
-        }
-
-        let grid_view: cosmic::Element<_> = if rows > 2 {
-            cosmic::widget::scrollable::vertical(grid)
-                .width(Length::Fixed(grid_width + 16.0))
+        let rows = entries
+            .iter()
+            .map(|entry| self.window_row(entry))
+            .collect::<Vec<_>>();
+        let list = cosmic::widget::column::with_children(rows)
+            .spacing(8.0)
+            .width(Length::Fill);
+        let total_height = entries
+            .iter()
+            .map(|entry| {
+                if self.preview_for(entry).is_some() {
+                    PREVIEW_ROW_HEIGHT_ESTIMATE
+                } else {
+                    COMPACT_ROW_HEIGHT_ESTIMATE
+                }
+            })
+            .sum::<f32>();
+        let viewport_height = total_height.clamp(COMPACT_ROW_HEIGHT_ESTIMATE, POPUP_MAX_HEIGHT);
+        let list: cosmic::Element<_> = if total_height > POPUP_MAX_HEIGHT {
+            cosmic::widget::scrollable::vertical(list)
                 .height(Length::Fixed(viewport_height))
+                .width(Length::Fill)
                 .into()
         } else {
-            grid.into()
+            list.into()
         };
-        children.push(grid_view);
 
-        if entries.len() > MAX_PREVIEW_IMAGES {
-            children.push(
-                cosmic::widget::text(format!(
-                    "Live thumbnails are capped at {MAX_PREVIEW_IMAGES}; all windows remain selectable."
-                ))
-                .into(),
-            );
+        let mut children: Vec<cosmic::Element<'_, Message>> = vec![header.into()];
+        if let Some(media) = self.media_section(group) {
+            children.push(media);
         }
-
+        children.push(list);
         let content = cosmic::widget::column::with_children(children)
-            .spacing(10.0)
-            .width(Length::Shrink);
+            .spacing(9.0)
+            .width(Length::Fill);
+        let content = cosmic::widget::container(content)
+            .width(Length::Fixed(POPUP_WIDTH))
+            .padding(POPUP_PADDING);
 
         cosmic::widget::mouse_area(content)
             .on_enter(Message::PopupEnter)
             .on_exit(Message::PopupExit)
             .into()
+    }
+
+    fn settings_popup_view(&self) -> cosmic::Element<'_, Message> {
+        let title = cosmic::widget::text::title3("Tihulu Minimizer Settings");
+        let safe_core = cosmic::widget::toggler(self.settings.mode.safe_core())
+            .label(Some("Safe Core".to_owned()))
+            .on_toggle(Message::ToggleSafeCore)
+            .width(Length::Fill);
+        let media = cosmic::widget::toggler(self.settings.media_enabled)
+            .label(Some("Media".to_owned()))
+            .on_toggle(Message::ToggleMedia)
+            .width(Length::Fill);
+        let preview = cosmic::widget::toggler(self.settings.preview_enabled)
+            .label(Some("Preview".to_owned()))
+            .on_toggle(Message::TogglePreview)
+            .width(Length::Fill);
+        let hover = cosmic::widget::toggler(self.settings.hover_popups)
+            .label(Some("Hover (experimental)".to_owned()))
+            .on_toggle(Message::ToggleHover)
+            .width(Length::Fill);
+
+        let mode_note = if self.settings.mode.safe_core() {
+            "Safe Core is active. Media, Preview and Hover are off. Enabling any rich option exits Safe Core."
+        } else {
+            "Safe Core is off. Rich features use external daemons and fall back independently when unavailable."
+        };
+        let media_note = if self.settings.media_enabled {
+            "Media backend: enabled · tihulu-mediad is queried while a click popup is open"
+        } else {
+            "Media backend: disabled"
+        };
+        let preview_note = if !self.settings.preview_enabled {
+            "Preview backend: disabled"
+        } else if self.preview_healthy {
+            "Preview backend: active · tihulu-previewd healthy"
+        } else {
+            "Preview backend: enabled · tihulu-previewd unavailable or waiting; compact fallback active"
+        };
+
+        let content = cosmic::widget::column::with_children(vec![
+            title.into(),
+            safe_core.into(),
+            media.into(),
+            preview.into(),
+            hover.into(),
+            cosmic::widget::text(mode_note).width(Length::Fill).into(),
+            cosmic::widget::text(media_note).width(Length::Fill).into(),
+            cosmic::widget::text(preview_note)
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(10.0)
+        .width(Length::Fill);
+
+        cosmic::widget::container(content)
+            .width(Length::Fixed(POPUP_WIDTH))
+            .padding(POPUP_PADDING)
+            .into()
+    }
+
+    fn accept_preview(&mut self, key: String, payload: PreviewPayload) {
+        if !self.preview_requested()
+            || payload.key != key
+            || !self.windows.iter().any(|entry| entry.identifier == key)
+        {
+            return;
+        }
+        if self
+            .previews
+            .get(&key)
+            .is_some_and(|current| current.generation > payload.generation)
+        {
+            return;
+        }
+        if !self.previews.contains_key(&key)
+            && self.previews.len() >= MAX_APPLET_PREVIEWS
+            && let Some(victim) = self.previews.keys().next().cloned()
+        {
+            self.previews.remove(&victim);
+        }
+        let handle = Handle::from_rgba(payload.width, payload.height, payload.rgba);
+        self.previews.insert(
+            key,
+            PreviewEntry {
+                generation: payload.generation,
+                handle,
+            },
+        );
+    }
+
+    fn preview_window_failed(&mut self, key: &str, error: &str) {
+        self.previews.remove(key);
+        tracing::debug!(
+            preview_key = key,
+            ?error,
+            "preview capture failed; compact fallback kept for this window"
+        );
     }
 }
 
@@ -744,16 +916,17 @@ impl cosmic::Application for MinimizedWindows {
         let mut app = Self {
             core,
             language: fde::get_languages_from_env(),
-            last_nonzero_volume: 1.0,
+            settings: config::load_settings(),
             ..Default::default()
         };
         app.reload_desktop_entries();
-
-        let hide = cosmic::iced::window::minimize::<cosmic::Action<Message>>(
-            app.core.main_window_id().unwrap(),
-            true,
-        );
-        (app, hide)
+        if app.preview_requested() {
+            app.preview_health_generation = 1;
+            let generation = app.preview_health_generation;
+            (app, Self::health_check_task(generation))
+        } else {
+            (app, cosmic::task::none())
+        }
     }
 
     fn core(&self) -> &cosmic::app::Core {
@@ -765,94 +938,69 @@ impl cosmic::Application for MinimizedWindows {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        let bridge = wayland::subscription().map(|event| Message::Bridge(Box::new(event)));
-        if self.preview_popup.is_some() && self.media.as_ref().is_some_and(|media| media.playing) {
+        let wayland = wayland::subscription().map(|event| Message::Bridge(Box::new(event)));
+        let media_popup_open = self.popup.is_pinned()
+            && self.media_requested()
+            && self.popup.active_group() != Some(SETTINGS_GROUP);
+        if media_popup_open {
             Subscription::batch([
-                bridge,
-                iced::time::every(Duration::from_secs(1)).map(|_| Message::MediaTick),
+                wayland,
+                cosmic::iced::time::every(MEDIA_REFRESH_INTERVAL)
+                    .map(|_| Message::MediaRefreshTick),
             ])
         } else {
-            bridge
+            wayland
         }
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::Bridge(event) => match *event {
-                BridgeEvent::Ready(tx) => {
-                    self.command_tx = Some(tx);
-                    self.request_next_preview();
-                }
+                BridgeEvent::Ready(tx) => self.command_tx = Some(tx),
                 BridgeEvent::Stopped => {
                     self.command_tx = None;
                     tracing::error!("Minimized-window Wayland bridge stopped");
                 }
                 BridgeEvent::Window(delta) => match *delta {
                     WindowDelta::Present(info) => {
-                        let was_empty = self.windows.is_empty();
+                        let handle = info.foreign_toplevel.clone();
+                        let identifier = info.identifier.trim().to_owned();
                         self.upsert(*info);
-                        if was_empty && !self.windows.is_empty() {
-                            return cosmic::iced::window::maximize(
-                                self.core.main_window_id().unwrap(),
-                                true,
-                            );
+                        if !identifier.is_empty()
+                            && self.preview_active()
+                            && self.popup.is_pinned()
+                            && let Some(group) = self
+                                .windows
+                                .iter()
+                                .find(|entry| entry.handle == handle)
+                                .map(|entry| entry.group_key.clone())
+                            && self.popup.active_group() == Some(group.as_str())
+                        {
+                            return self.capture_group_task(&group);
                         }
                     }
                     WindowDelta::Gone(handle) => {
-                        let removed_group = self.remove(&handle);
-                        self.preview_images.remove(&handle);
-                        self.preview_queue.retain(|queued| queued != &handle);
-
-                        let group_disappeared = removed_group.as_deref().is_some_and(|group| {
-                            self.active_group.as_deref() == Some(group)
-                                && self.group_count(group) == 0
+                        let preview_was_requested = self.preview_requested();
+                        let removed = self.remove(&handle);
+                        let active_disappeared = removed.group.as_deref().is_some_and(|group| {
+                            self.popup.active_group() == Some(group) && self.group_count(group) == 0
                         });
-                        let close = if group_disappeared {
-                            self.close_preview_surface()
+                        let close = if active_disappeared {
+                            self.close_popup()
                         } else {
                             cosmic::task::none()
                         };
-
-                        if self.windows.is_empty() {
-                            let hide = cosmic::iced::window::minimize(
-                                self.core.main_window_id().unwrap(),
-                                true,
-                            );
-                            return Task::batch([close, hide]);
-                        }
-                        return close;
+                        let maintenance = if preview_was_requested {
+                            Self::gone_task(removed.identifier)
+                        } else {
+                            cosmic::task::none()
+                        };
+                        return Task::batch([close, maintenance]);
                     }
                 },
-                BridgeEvent::Preview(handle, image) => {
-                    if self.preview_inflight.as_ref() == Some(&handle) {
-                        self.preview_inflight = None;
-                        if let Some(group) = self.active_group.as_deref()
-                            && self.group_contains_handle(group, &handle)
-                            && let Some(image) = image
-                        {
-                            self.preview_images.insert(
-                                handle,
-                                Handle::from_rgba(image.width, image.height, image.rgba),
-                            );
-                        }
-                        self.request_next_preview();
-                    } else if self.preview_popup.is_some()
-                        && let (Some(current), Some(tx)) =
-                            (self.preview_inflight.clone(), self.command_tx.clone())
-                    {
-                        let _ = tx.send(BridgeCommand::CapturePreview(current));
-                    }
-                }
             },
             Message::GroupPrimary(group) => {
-                let handles = self.group_handles(&group);
-                if handles.len() == 1 {
-                    if let Some(tx) = &self.command_tx {
-                        let _ = tx.send(BridgeCommand::Restore(handles[0].clone()));
-                    }
-                    return self.close_preview_surface();
-                }
-                if !handles.is_empty() {
+                if self.group_count(&group) > 0 {
                     return self.open_group(group, true);
                 }
             }
@@ -862,167 +1010,244 @@ impl cosmic::Application for MinimizedWindows {
                 }
             }
             Message::GroupHoverEnter(group) => {
-                self.close_epoch = self.close_epoch.wrapping_add(1);
-                self.hover_epoch = self.hover_epoch.wrapping_add(1);
-                let epoch = self.hover_epoch;
-                self.hover_group = Some(group.clone());
-
-                if self.active_group.as_deref() == Some(group.as_str())
-                    && self.preview_popup.is_some()
-                {
-                    if !self.popup_pinned {
-                        return self.refresh_open_group(&group);
+                if self.settings.hover_popups {
+                    self.popup.group_enter(group.clone());
+                    if !self.popup.is_pinned() {
+                        return self.open_group(group, false);
                     }
-                    return cosmic::task::none();
                 }
-
-                // Pinned popups no longer globally disable hover. Keep the old popup
-                // visible during the delay and replace it only if this hover is still active.
-                return Self::hover_delay_task(group, epoch);
             }
             Message::GroupHoverExit(group) => {
-                if self.hover_group.as_deref() == Some(group.as_str()) {
-                    self.hover_group = None;
-                    self.hover_epoch = self.hover_epoch.wrapping_add(1);
-                }
-                if self.preview_popup.is_some()
-                    && self.active_group.as_deref() == Some(group.as_str())
-                    && !self.popup_pinned
-                {
-                    return self.schedule_close();
+                if self.settings.hover_popups {
+                    self.popup.group_exit(&group);
+                    if self.popup.is_open() && !self.popup.is_pinned() {
+                        return self.schedule_close();
+                    }
                 }
             }
-            Message::HoverDelayElapsed(group, epoch) => {
-                if self.hover_epoch == epoch && self.hover_group.as_deref() == Some(group.as_str())
-                {
-                    return self.open_group(group, false);
-                }
-            }
-            Message::PopupEnter => {
-                self.popup_hovered = true;
-                self.close_epoch = self.close_epoch.wrapping_add(1);
-            }
+            Message::OpenSettings => return self.toggle_settings_popup(),
+            Message::PopupEnter => self.popup.popup_enter(),
             Message::PopupExit => {
-                self.popup_hovered = false;
-                if !self.popup_pinned {
+                self.popup.popup_exit();
+                if !self.popup.is_pinned() {
                     return self.schedule_close();
                 }
             }
-            Message::CloseDelayElapsed(epoch) => {
-                if self.close_epoch == epoch
-                    && !self.popup_pinned
-                    && self.hover_group.is_none()
-                    && !self.popup_hovered
-                {
-                    return self.close_preview_surface();
+            Message::CloseDelayElapsed(guard) => {
+                if self.popup.should_close(guard) {
+                    return self.close_popup();
                 }
             }
             Message::Restore(handle) => {
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(BridgeCommand::Restore(handle));
                 }
-                self.hover_epoch = self.hover_epoch.wrapping_add(1);
-                self.hover_group = None;
-                return self.close_preview_surface();
+                return self.close_popup();
             }
             Message::CloseWindow(handle) => {
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(BridgeCommand::Close(handle));
                 }
             }
-            Message::PreviewClosed(id) => {
-                if self.preview_popup == Some(id) {
-                    self.preview_popup = None;
-                    self.clear_popup_state();
+            Message::PopupClosed(id) => match self.popup.compositor_closed(id) {
+                CloseOutcome::Ignored | CloseOutcome::Closed => {}
+                CloseOutcome::OpenPending { group, pinned } => {
+                    if group == SETTINGS_GROUP {
+                        return self.request_settings_open();
+                    }
+                    if self.group_count(&group) > 0 {
+                        return self.open_group(group, pinned);
+                    }
+                }
+            },
+            Message::ToggleSafeCore(enabled) => {
+                if enabled {
+                    let close_hover_popup = self.popup.is_hover_open();
+                    self.settings.mode = FeatureMode::SafeCore;
+                    self.settings.media_enabled = false;
+                    self.settings.preview_enabled = false;
+                    self.settings.hover_popups = false;
+                    self.media_players.clear();
+                    self.media_seek_drafts.clear();
+                    self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
+                    self.preview_healthy = false;
+                    self.previews.clear();
+                    self.persist_settings();
+                    let close = if close_hover_popup {
+                        self.close_popup()
+                    } else {
+                        cosmic::task::none()
+                    };
+                    return Task::batch([close, Self::clear_preview_task()]);
+                }
+                self.settings.mode = FeatureMode::Extended;
+                self.persist_settings();
+            }
+            Message::ToggleMedia(enabled) => {
+                self.settings.media_enabled = enabled;
+                if enabled {
+                    self.settings.mode = FeatureMode::Extended;
+                } else {
+                    self.media_players.clear();
+                    self.media_seek_drafts.clear();
+                }
+                self.persist_settings();
+            }
+            Message::TogglePreview(enabled) => {
+                self.settings.preview_enabled = enabled;
+                self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
+                let generation = self.preview_health_generation;
+                self.preview_healthy = false;
+                self.previews.clear();
+                if enabled {
+                    self.settings.mode = FeatureMode::Extended;
+                    self.persist_settings();
+                    return Self::health_check_task(generation);
+                }
+                self.persist_settings();
+                return Self::clear_preview_task();
+            }
+            Message::ToggleHover(enabled) => {
+                self.settings.hover_popups = enabled;
+                if enabled {
+                    self.settings.mode = FeatureMode::Extended;
+                }
+                self.persist_settings();
+                if !enabled && self.popup.is_hover_open() {
+                    return self.close_popup();
                 }
             }
-            Message::MediaLoaded(group, snapshot) => {
-                if self.active_group.as_deref() != Some(group.as_str())
-                    || self.preview_popup.is_none()
-                {
-                    return cosmic::task::none();
-                }
-
-                let Some(snapshot) = snapshot else {
-                    self.media = None;
-                    self.media_loaded_at = None;
-                    self.media_art_url = None;
-                    self.media_art = None;
-                    return cosmic::task::none();
-                };
-                let snapshot = *snapshot;
-                if snapshot.volume > 0.01 {
-                    self.last_nonzero_volume = snapshot.volume;
-                }
-
-                let old_art_url = self.media_art_url.clone();
-                let new_art_url = snapshot.art_url.clone();
-                self.media = Some(snapshot);
-                self.media_loaded_at = Some(Instant::now());
-
-                if old_art_url != new_art_url {
-                    self.media_art = None;
-                    self.media_art_url = new_art_url.clone();
-                    if let Some(url) = new_art_url {
-                        return Self::load_art_task(group, url);
+            Message::MediaLoaded(group, result) => {
+                self.media_seek_drafts.remove(&group);
+                if !self.media_requested() || self.group_count(&group) == 0 {
+                    self.media_players.remove(&group);
+                } else {
+                    match result {
+                        Ok(Some(player)) => {
+                            self.media_players.insert(group, player);
+                        }
+                        Ok(None) => {
+                            self.media_players.remove(&group);
+                        }
+                        Err(error) => {
+                            self.media_players.remove(&group);
+                            tracing::debug!(
+                                ?error,
+                                "mediad unavailable; normal popup remains active"
+                            );
+                        }
                     }
                 }
             }
-            Message::MediaArtworkLoaded(group, url, artwork) => {
-                if self.active_group.as_deref() == Some(group.as_str())
-                    && self.preview_popup.is_some()
-                    && self.media_art_url.as_deref() == Some(url.as_str())
-                {
-                    self.media_art = artwork.map(|artwork| {
-                        let artwork =
-                            Arc::try_unwrap(artwork).unwrap_or_else(|artwork| (*artwork).clone());
-                        Handle::from_rgba(artwork.width, artwork.height, artwork.rgba)
+            Message::MediaControl {
+                group,
+                bus_name,
+                action,
+            } => {
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    return Self::media_control_task(group, bus_name, action);
+                }
+            }
+            Message::MediaControlDone(group, result) => {
+                if let Err(error) = result {
+                    tracing::warn!(?error, "MPRIS control failed");
+                }
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    return Self::media_status_task(group);
+                }
+            }
+            Message::MediaSeekChanged { group, fraction } => {
+                let fraction = fraction.clamp(0.0, 1.0);
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    let request = self.media_players.get(&group).and_then(|player| {
+                        let length = player.length_micros.filter(|length| *length > 0)?;
+                        let track_id = player.track_id.clone()?;
+                        if !player.can_seek {
+                            return None;
+                        }
+                        let position =
+                            ((fraction as f64 * length as f64).round() as i64).clamp(0, length);
+                        Some((player.bus_name.clone(), track_id, position))
                     });
+                    if let Some((bus_name, track_id, position)) = request {
+                        self.media_seek_drafts.insert(group.clone(), fraction);
+                        return Self::media_seek_task(group, bus_name, track_id, position);
+                    }
                 }
             }
-            Message::MediaControl(action) => {
-                let Some(media) = self.media.as_ref() else {
-                    return cosmic::task::none();
-                };
-                let Some(group) = self.active_group.clone() else {
-                    return cosmic::task::none();
-                };
-                let bus_name = media.bus_name.clone();
-                let audio_stream_ids = media.audio_stream_ids.clone();
-                let command = match action {
-                    MediaUiAction::Previous => MediaCommand::Previous,
-                    MediaUiAction::PlayPause => MediaCommand::PlayPause,
-                    MediaUiAction::Next => MediaCommand::Next,
-                    MediaUiAction::VolumeDown => {
-                        MediaCommand::SetVolume((media.volume - 0.05).max(0.0))
-                    }
-                    MediaUiAction::VolumeUp => {
-                        MediaCommand::SetVolume((media.volume + 0.05).min(1.5))
-                    }
-                    MediaUiAction::Mute => {
-                        if !media.muted && media.volume > 0.01 {
-                            self.last_nonzero_volume = media.volume;
-                        }
-                        MediaCommand::SetMuted {
-                            muted: !media.muted,
-                            restore_volume: self.last_nonzero_volume.max(0.05),
-                        }
-                    }
-                };
-
-                return Task::perform(
-                    media::command(bus_name, audio_stream_ids, command),
-                    move |_| cosmic::Action::App(Message::RefreshMedia(group)),
-                );
+            Message::MediaSeekDone(group, result) => {
+                if let Err(error) = result {
+                    self.media_seek_drafts.remove(&group);
+                    tracing::warn!(?error, "MPRIS seek failed");
+                }
+                if self.media_requested() && self.group_count(&group) > 0 {
+                    return Self::media_status_task(group);
+                }
             }
-            Message::RefreshMedia(group) => {
-                if self.active_group.as_deref() == Some(group.as_str())
-                    && self.preview_popup.is_some()
+            Message::MediaRefreshTick => {
+                if self.popup.is_pinned()
+                    && self.media_requested()
+                    && let Some(group) = self.popup.active_group().map(str::to_owned)
+                    && group != SETTINGS_GROUP
+                    && self.group_count(&group) > 0
                 {
-                    return self.load_media_task(&group);
+                    return Self::media_status_task(group);
                 }
             }
-            Message::MediaTick => {}
+            Message::PreviewBatchLoaded(results) => {
+                for (key, result) in results {
+                    match result {
+                        Ok(payload) => self.accept_preview(key, payload),
+                        Err(error) => self.preview_window_failed(&key, &error),
+                    }
+                }
+            }
+            Message::PreviewHealthTick(generation) => {
+                if generation == self.preview_health_generation && self.preview_requested() {
+                    return Self::health_check_task(generation);
+                }
+            }
+            Message::PreviewHealthChecked(generation, result) => {
+                if generation != self.preview_health_generation || !self.preview_requested() {
+                    return cosmic::task::none();
+                }
+
+                let recovery = match result {
+                    Ok(()) => {
+                        let was_healthy = self.preview_healthy;
+                        self.preview_healthy = true;
+                        if was_healthy || !self.popup.is_pinned() {
+                            cosmic::task::none()
+                        } else if let Some(group) = self.popup.active_group().map(str::to_owned) {
+                            if group == SETTINGS_GROUP || self.group_count(&group) == 0 {
+                                cosmic::task::none()
+                            } else {
+                                self.capture_group_task(&group)
+                            }
+                        } else {
+                            cosmic::task::none()
+                        }
+                    }
+                    Err(error) => {
+                        if self.preview_healthy || !self.previews.is_empty() {
+                            tracing::warn!(
+                                ?error,
+                                "previewd health check failed; compact fallback active"
+                            );
+                        }
+                        self.preview_healthy = false;
+                        self.previews.clear();
+                        cosmic::task::none()
+                    }
+                };
+                return Task::batch([recovery, Self::health_delay_task(generation)]);
+            }
+            Message::PreviewMaintenanceDone => {}
+            Message::Surface(action) => {
+                return cosmic::task::message(cosmic::Action::Cosmic(
+                    cosmic::app::Action::Surface(action),
+                ));
+            }
         }
 
         cosmic::task::none()
@@ -1030,12 +1255,13 @@ impl cosmic::Application for MinimizedWindows {
 
     fn view(&self) -> cosmic::Element<'_, Self::Message> {
         let mut seen = HashSet::new();
-        let children = self
+        let mut children = self
             .windows
             .iter()
             .filter(|entry| seen.insert(entry.group_key.as_str()))
             .map(|entry| self.group_button(entry, self.group_count(&entry.group_key)))
             .collect::<Vec<_>>();
+        children.push(self.settings_button());
 
         let content: cosmic::Element<_> = if self.core.applet.is_horizontal() {
             cosmic::widget::row::with_children(children)
@@ -1059,18 +1285,20 @@ impl cosmic::Application for MinimizedWindows {
     }
 
     fn view_window(&self, id: WindowId) -> cosmic::Element<'_, Self::Message> {
-        if self.preview_popup == Some(id) {
-            self.core
-                .applet
-                .popup_container(self.group_preview())
-                .into()
+        if self.popup.window_id() == Some(id) {
+            let content = if self.popup.active_group() == Some(SETTINGS_GROUP) {
+                self.settings_popup_view()
+            } else {
+                self.group_popup_view()
+            };
+            self.core.applet.popup_container(content).into()
         } else {
             cosmic::widget::space::horizontal().into()
         }
     }
 
     fn on_close_requested(&self, id: WindowId) -> Option<Self::Message> {
-        Some(Message::PreviewClosed(id))
+        Some(Message::PopupClosed(id))
     }
 }
 
@@ -1080,10 +1308,47 @@ fn canonical_group_key(app_id: &str, app_label: &str) -> String {
     } else {
         app_id.trim()
     };
-    raw.trim_end_matches(".desktop").to_ascii_lowercase()
+    let normalized = normalize_identifier(raw.trim_end_matches(".desktop"));
+
+    const BROWSER_ALIASES: &[(&str, &str)] = &[
+        ("brave", "browser:brave"),
+        ("firefox", "browser:firefox"),
+        ("chromium", "browser:chromium"),
+        ("googlechrome", "browser:chrome"),
+        ("chrome", "browser:chrome"),
+        ("vivaldi", "browser:vivaldi"),
+        ("opera", "browser:opera"),
+        ("microsoftedge", "browser:edge"),
+    ];
+    for (needle, canonical) in BROWSER_ALIASES {
+        if normalized.contains(needle) {
+            return (*canonical).to_owned();
+        }
+    }
+
+    if normalized.is_empty() {
+        "application".to_owned()
+    } else {
+        normalized
+    }
 }
 
-fn format_time(microseconds: i64) -> String {
-    let seconds = (microseconds.max(0) / 1_000_000) as u64;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
+fn normalize_identifier(input: &str) -> String {
+    input
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn format_media_time(micros: i64) -> String {
+    let seconds = (micros.max(0) / 1_000_000) as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
