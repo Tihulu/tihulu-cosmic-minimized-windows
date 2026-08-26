@@ -28,10 +28,7 @@ fn normalize(input: &str) -> String {
         .collect()
 }
 
-async fn read_player(
-    connection: &Connection,
-    bus_name: &str,
-) -> Result<MediaPlayerState, String> {
+async fn read_player(connection: &Connection, bus_name: &str) -> Result<MediaPlayerState, String> {
     let root = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_ROOT)
         .await
         .map_err(|error| format!("MPRIS root proxy failed: {error}"))?;
@@ -212,7 +209,8 @@ fn prepare_socket(path: &Path) -> Result<(), String> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let result = async {
-        let path = media_socket_path().ok_or_else(|| "XDG_RUNTIME_DIR is unavailable".to_owned())?;
+        let path =
+            media_socket_path().ok_or_else(|| "XDG_RUNTIME_DIR is unavailable".to_owned())?;
         prepare_socket(&path)?;
         let listener = UnixListener::bind(&path)
             .map_err(|error| format!("media socket bind failed: {error}"))?;
