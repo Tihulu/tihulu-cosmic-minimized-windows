@@ -10,8 +10,8 @@ const CONFIG_FILE: &str = "config";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FeatureMode {
-    #[default]
     SafeCore,
+    #[default]
     Extended,
 }
 
@@ -74,9 +74,9 @@ pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
 
-    // Safe Core remains the default, while Extended is now a real persisted
-    // user preference. Optional preview/media subsystems still fall back to
-    // Safe Core behavior when they are unavailable or unhealthy.
+    // Extended is the normal/default mode. Safe Core remains an explicit
+    // fallback switch the user can enable at any time. Hover stays independent
+    // and opt-in because hover-driven popup churn was unstable in real COSMIC tests.
     let contents = format!(
         "mode={}\nhover-popups={}\n",
         mode.as_config_value(),
@@ -116,9 +116,9 @@ mod tests {
     use super::{FeatureMode, parse_hover_popups};
 
     #[test]
-    fn persisted_mode_defaults_to_safe_core_and_accepts_extended() {
-        assert_eq!(FeatureMode::parse(""), FeatureMode::SafeCore);
-        assert_eq!(FeatureMode::parse("mode=unknown\n"), FeatureMode::SafeCore);
+    fn persisted_mode_defaults_to_extended_and_accepts_safe_core() {
+        assert_eq!(FeatureMode::parse(""), FeatureMode::Extended);
+        assert_eq!(FeatureMode::parse("mode=unknown\n"), FeatureMode::Extended);
         assert_eq!(FeatureMode::parse("mode=safe-core\n"), FeatureMode::SafeCore);
         assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::Extended);
     }
@@ -136,7 +136,7 @@ mod tests {
         assert!(!parse_hover_popups(""));
         assert!(!parse_hover_popups("hover-popups=false\n"));
         assert!(!parse_hover_popups("hover-popups=1\n"));
-        assert!(parse_hover_popups("mode=safe-core\nhover-popups=true\n"));
+        assert!(parse_hover_popups("mode=extended\nhover-popups=true\n"));
         assert!(parse_hover_popups("hover-popups=TRUE\n"));
     }
 }
