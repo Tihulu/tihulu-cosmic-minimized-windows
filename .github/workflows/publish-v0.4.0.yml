@@ -1,0 +1,43 @@
+name: Publish v0.4.0
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish v0.4.0 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: 3417a16e10d2b6312b32d6aee3d11edb5f04ee53
+        run: |
+          set -euo pipefail
+          if gh release view v0.4.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v0.4.0 already exists; nothing to do."
+            exit 0
+          fi
+          cat > /tmp/v0.4.0-notes.md <<'EOF'
+          First stable release of Tihulu COSMIC Minimized Windows.
+
+          Highlights:
+          - Stability-first minimized-window grouping for COSMIC
+          - External `tihulu-previewd` preview daemon with bounded capture/cache behavior
+          - External `tihulu-mediad` MPRIS daemon
+          - Track metadata, album artwork, playback controls, volume and ±10s seek
+          - Click/pinned rich window previews with per-window compact fallback
+          - Safe Core fallback mode
+          - Manual Reload backends recovery in Settings
+          - Hover remains experimental and disabled by default
+          - Real COSMIC runtime recovery verified without restarting `cosmic-panel`
+          EOF
+          gh release create v0.4.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "v0.4.0" \
+            --notes-file /tmp/v0.4.0-notes.md
