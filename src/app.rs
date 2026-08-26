@@ -280,13 +280,7 @@ impl MinimizedWindows {
                 .join("\n");
             self.core
                 .applet
-                .applet_tooltip(
-                    area,
-                    tooltip,
-                    self.popup.is_open(),
-                    Message::Surface,
-                    None,
-                )
+                .applet_tooltip(area, tooltip, self.popup.is_open(), Message::Surface, None)
                 .into()
         }
     }
