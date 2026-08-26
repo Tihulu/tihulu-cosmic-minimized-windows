@@ -6,7 +6,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -61,16 +61,18 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: rust
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Promote verified main to stable
         run: |
-          git fetch origin main
+          git fetch origin main stable
           CURRENT_MAIN="$(git rev-parse origin/main)"
           if [ "$CURRENT_MAIN" != "$GITHUB_SHA" ]; then
             echo "A newer main commit exists; skipping stable promotion."
             exit 0
           fi
-          git push --force origin "${GITHUB_SHA}:refs/heads/stable"
+          git push origin "${GITHUB_SHA}:refs/heads/stable"
