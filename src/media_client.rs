@@ -41,6 +41,25 @@ pub(crate) async fn control(bus_name: String, action: MediaAction) -> Result<(),
     }
 }
 
+pub(crate) async fn seek(
+    bus_name: String,
+    track_id: String,
+    position_micros: i64,
+) -> Result<(), String> {
+    match request(MediaRequest::Seek {
+        version: MEDIA_PROTOCOL_VERSION,
+        bus_name,
+        track_id,
+        position_micros,
+    })
+    .await?
+    {
+        MediaResponse::State { version, .. } if version == MEDIA_PROTOCOL_VERSION => Ok(()),
+        MediaResponse::State { version, .. } => Err(format!("media protocol mismatch: {version}")),
+        MediaResponse::Error { message, .. } => Err(message),
+    }
+}
+
 async fn request(request: MediaRequest) -> Result<MediaResponse, String> {
     tokio::time::timeout(REQUEST_TIMEOUT, request_inner(request))
         .await
