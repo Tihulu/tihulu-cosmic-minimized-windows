@@ -2,6 +2,11 @@
 
 use cosmic::iced::window::Id as WindowId;
 
+// Real COSMIC runtime testing showed repeated hover-triggered popup surface
+// creation can restart cosmic-panel. Safe Core therefore blocks hover opening
+// completely. Click/right-click popup creation remains available.
+const HOVER_POPUPS_ENABLED: bool = false;
+
 #[derive(Clone, Debug)]
 struct PopupSession {
     group: String,
@@ -67,13 +72,14 @@ impl PopupFsm {
     }
 
     pub(crate) fn is_pinned(&self) -> bool {
+        // app.rs uses this before opening a hover popup. While Safe Core hover
+        // is disabled, treat a closed FSM as blocking hover-open. A popup
+        // explicitly opened by click/right-click still enters Pinned normally.
         matches!(self.state, PopupState::Pinned(_))
+            || (!HOVER_POPUPS_ENABLED && matches!(self.state, PopupState::Closed))
     }
 
     pub(crate) fn group_enter(&mut self, group: String) {
-        // The panel icon and popup are separate Wayland surfaces. Entering one
-        // means the pointer cannot still be inside the other. Clearing the
-        // opposite flag also repairs a missed cross-surface on_exit event.
         self.pointer_in_popup = false;
         self.pointer_group = Some(group);
         self.invalidate_close();
@@ -84,8 +90,6 @@ impl PopupFsm {
             self.pointer_group = None;
         }
 
-        // A hover-only switch is no longer wanted once the pointer leaves its
-        // target icon before the compositor acknowledges the old popup close.
         if self
             .pending_open
             .as_ref()
@@ -96,8 +100,6 @@ impl PopupFsm {
     }
 
     pub(crate) fn popup_enter(&mut self) {
-        // A popup enter is authoritative: if the panel icon's exit event was
-        // lost while crossing surfaces, do not keep a stale group hover alive.
         self.pointer_group = None;
         self.pointer_in_popup = true;
         self.invalidate_close();
@@ -116,9 +118,6 @@ impl PopupFsm {
         self.invalidate_close();
 
         if self.pending_open.is_some() {
-            // The old popup is already being destroyed. Only update the desired
-            // destination; never send a second destroy/create pair while the
-            // compositor close acknowledgement is still pending.
             self.pending_open = Some(PendingOpen { group, pinned });
             return OpenPlan::None;
         }
@@ -255,10 +254,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hover_open_from_closed_creates_surface() {
+    fn safe_core_closed_state_blocks_hover_open_call_site() {
+        let mut fsm = PopupFsm::default();
+        fsm.group_enter("brave".into());
+        assert!(fsm.is_pinned());
+        assert!(!fsm.is_open());
+    }
+
+    #[test]
+    fn explicit_hover_request_still_has_consistent_internal_state() {
         let mut fsm = PopupFsm::default();
         let id = WindowId::unique();
-        fsm.group_enter("brave".into());
         let plan = fsm.request_open("brave".into(), false, id);
         assert_eq!(
             plan,
