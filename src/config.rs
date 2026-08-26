@@ -7,7 +7,7 @@ use std::{
 
 const CONFIG_DIR: &str = "tihulu-cosmic-minimized-windows";
 const CONFIG_FILE: &str = "config";
-const CONFIG_VERSION: u32 = 2;
+const CONFIG_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FeatureMode {
@@ -21,29 +21,12 @@ impl FeatureMode {
         matches!(self, Self::SafeCore)
     }
 
-    fn parse(contents: &str) -> Self {
-        // Older v0.4 RCs forcibly wrote mode=safe-core. Those files did not
-        // carry config-version=2, so treat them as legacy and migrate to the
-        // new normal/default Extended mode instead of preserving a forced state.
-        if parse_config_version(contents) != Some(CONFIG_VERSION) {
-            return Self::Extended;
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "extended" => Some(Self::Extended),
+            "safe-core" => Some(Self::SafeCore),
+            _ => None,
         }
-
-        contents
-            .lines()
-            .find_map(|line| {
-                let (key, value) = line.split_once('=')?;
-                if key.trim() != "mode" {
-                    return None;
-                }
-
-                match value.trim() {
-                    "extended" => Some(Self::Extended),
-                    "safe-core" => Some(Self::SafeCore),
-                    _ => None,
-                }
-            })
-            .unwrap_or_default()
     }
 
     fn as_config_value(self) -> &'static str {
@@ -54,24 +37,33 @@ impl FeatureMode {
     }
 }
 
-pub(crate) fn load_feature_mode() -> FeatureMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Settings {
+    pub(crate) mode: FeatureMode,
+    pub(crate) media_enabled: bool,
+    pub(crate) preview_enabled: bool,
+    pub(crate) hover_popups: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            mode: FeatureMode::Extended,
+            media_enabled: true,
+            preview_enabled: true,
+            hover_popups: false,
+        }
+    }
+}
+
+pub(crate) fn load_settings() -> Settings {
     read_config()
-        .map(|contents| FeatureMode::parse(&contents))
+        .as_deref()
+        .map(parse_settings)
         .unwrap_or_default()
 }
 
-pub(crate) fn load_hover_popups() -> bool {
-    read_config()
-        .as_deref()
-        .map(parse_hover_popups)
-        .unwrap_or(false)
-}
-
-pub(crate) fn save_feature_mode(mode: FeatureMode) -> io::Result<()> {
-    save_settings(mode, load_hover_popups())
-}
-
-pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result<()> {
+pub(crate) fn save_settings(settings: Settings) -> io::Result<()> {
     let Some(path) = config_path() else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -82,21 +74,71 @@ pub(crate) fn save_settings(mode: FeatureMode, hover_popups: bool) -> io::Result
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
 
-    // Extended is the normal/default mode. Safe Core remains an explicit
-    // fallback switch the user can enable at any time. Hover stays independent
-    // and opt-in because hover-driven popup churn was unstable in real COSMIC tests.
     let contents = format!(
-        "config-version={}\nmode={}\nhover-popups={}\n",
+        "config-version={}\nmode={}\nmedia={}\npreview={}\nhover-popups={}\n",
         CONFIG_VERSION,
-        mode.as_config_value(),
-        if hover_popups { "true" } else { "false" }
+        settings.mode.as_config_value(),
+        bool_value(settings.media_enabled),
+        bool_value(settings.preview_enabled),
+        bool_value(settings.hover_popups),
     );
     fs::write(&temporary, contents)?;
     fs::rename(temporary, path)
 }
 
+fn bool_value(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
 fn read_config() -> Option<String> {
     config_path().and_then(|path| fs::read_to_string(path).ok())
+}
+
+fn parse_settings(contents: &str) -> Settings {
+    // v0.4 RC configs before v3 contained forced Safe Core state and partial
+    // hover-only settings. Migrate them to the new user-facing defaults once.
+    if parse_config_version(contents) != Some(CONFIG_VERSION) {
+        return Settings::default();
+    }
+
+    let mut settings = Settings::default();
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "mode" => {
+                if let Some(mode) = FeatureMode::parse(value) {
+                    settings.mode = mode;
+                }
+            }
+            "media" => {
+                if let Some(enabled) = parse_bool(value) {
+                    settings.media_enabled = enabled;
+                }
+            }
+            "preview" => {
+                if let Some(enabled) = parse_bool(value) {
+                    settings.preview_enabled = enabled;
+                }
+            }
+            "hover-popups" => {
+                if let Some(enabled) = parse_bool(value) {
+                    settings.hover_popups = enabled;
+                }
+            }
+            _ => {}
+        }
+    }
+    settings
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_config_version(contents: &str) -> Option<u32> {
@@ -105,15 +147,6 @@ fn parse_config_version(contents: &str) -> Option<u32> {
         (key.trim() == "config-version")
             .then(|| value.trim().parse::<u32>().ok())
             .flatten()
-    })
-}
-
-fn parse_hover_popups(contents: &str) -> bool {
-    contents.lines().any(|line| {
-        let Some((key, value)) = line.split_once('=') else {
-            return false;
-        };
-        key.trim() == "hover-popups" && value.trim().eq_ignore_ascii_case("true")
     })
 }
 
@@ -131,55 +164,55 @@ fn config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FeatureMode, parse_config_version, parse_hover_popups};
+    use super::{FeatureMode, Settings, parse_config_version, parse_settings};
 
     #[test]
-    fn legacy_configs_migrate_to_extended() {
-        assert_eq!(FeatureMode::parse(""), FeatureMode::Extended);
-        assert_eq!(
-            FeatureMode::parse("mode=safe-core\n"),
-            FeatureMode::Extended
-        );
-        assert_eq!(FeatureMode::parse("mode=extended\n"), FeatureMode::Extended);
+    fn defaults_match_normal_user_mode() {
+        let settings = Settings::default();
+        assert_eq!(settings.mode, FeatureMode::Extended);
+        assert!(settings.media_enabled);
+        assert!(settings.preview_enabled);
+        assert!(!settings.hover_popups);
     }
 
     #[test]
-    fn versioned_config_persists_explicit_mode() {
+    fn old_rc_configs_migrate_to_new_defaults() {
+        assert_eq!(parse_settings(""), Settings::default());
         assert_eq!(
-            FeatureMode::parse("config-version=2\nmode=safe-core\n"),
-            FeatureMode::SafeCore
+            parse_settings("config-version=2\nmode=safe-core\nhover-popups=true\n"),
+            Settings::default()
         );
+    }
+
+    #[test]
+    fn versioned_settings_persist_independently() {
         assert_eq!(
-            FeatureMode::parse("config-version=2\nmode=extended\n"),
-            FeatureMode::Extended
+            parse_settings(
+                "config-version=3\nmode=safe-core\nmedia=false\npreview=true\nhover-popups=true\n"
+            ),
+            Settings {
+                mode: FeatureMode::SafeCore,
+                media_enabled: false,
+                preview_enabled: true,
+                hover_popups: true,
+            }
         );
+    }
+
+    #[test]
+    fn invalid_values_keep_defaults() {
         assert_eq!(
-            FeatureMode::parse("config-version=2\nmode=unknown\n"),
-            FeatureMode::Extended
+            parse_settings(
+                "config-version=3\nmode=nope\nmedia=nope\npreview=nope\nhover-popups=nope\n"
+            ),
+            Settings::default()
         );
     }
 
     #[test]
     fn config_version_parser_is_strict() {
+        assert_eq!(parse_config_version("config-version=3\n"), Some(3));
         assert_eq!(parse_config_version("config-version=2\n"), Some(2));
-        assert_eq!(parse_config_version("config-version=1\n"), Some(1));
         assert_eq!(parse_config_version("config-version=nope\n"), None);
-    }
-
-    #[test]
-    fn feature_mode_reports_requested_safe_core_state() {
-        assert!(FeatureMode::SafeCore.safe_core());
-        assert!(!FeatureMode::Extended.safe_core());
-        assert_eq!(FeatureMode::SafeCore.as_config_value(), "safe-core");
-        assert_eq!(FeatureMode::Extended.as_config_value(), "extended");
-    }
-
-    #[test]
-    fn hover_popups_default_off_and_require_explicit_true() {
-        assert!(!parse_hover_popups(""));
-        assert!(!parse_hover_popups("hover-popups=false\n"));
-        assert!(!parse_hover_popups("hover-popups=1\n"));
-        assert!(parse_hover_popups("mode=extended\nhover-popups=true\n"));
-        assert!(parse_hover_popups("hover-popups=TRUE\n"));
     }
 }
