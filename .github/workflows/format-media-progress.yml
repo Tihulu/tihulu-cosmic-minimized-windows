@@ -1,0 +1,29 @@
+name: Format media progress
+
+on:
+  push:
+    branches:
+      - fix/media-progress-tick
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/media-progress-tick
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply rustfmt
+        run: |
+          cargo fmt --all
+          rm .github/workflows/format-media-progress.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs .github/workflows/format-media-progress.yml
+          git commit -m "style: format media progress UI"
+          git push origin HEAD:fix/media-progress-tick
