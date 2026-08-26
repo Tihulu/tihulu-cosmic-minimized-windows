@@ -475,7 +475,9 @@ impl MinimizedWindows {
             hover.into(),
             cosmic::widget::text(mode_note).width(Length::Fill).into(),
             cosmic::widget::text(media_note).width(Length::Fill).into(),
-            cosmic::widget::text(preview_note).width(Length::Fill).into(),
+            cosmic::widget::text(preview_note)
+                .width(Length::Fill)
+                .into(),
         ])
         .spacing(10.0)
         .width(Length::Fill);
