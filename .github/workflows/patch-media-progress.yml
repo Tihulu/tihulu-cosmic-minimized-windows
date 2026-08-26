@@ -1,0 +1,97 @@
+name: Patch media progress tick
+
+on:
+  push:
+    branches:
+      - fix/media-progress-tick
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'fix: interpolate media progress every second'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/media-progress-tick
+      - name: Apply focused media progress patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/app.rs')
+          text = path.read_text()
+
+          replacements = [
+              (
+                  '    time::Duration,\n',
+                  '    time::{Duration, Instant},\n',
+              ),
+              (
+                  'const MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(2500);\n',
+                  'const MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(2500);\nconst MEDIA_UI_TICK_INTERVAL: Duration = Duration::from_secs(1);\n',
+              ),
+              (
+                  '    media_players: HashMap<String, MediaPlayerState>,\n    media_seek_drafts: HashMap<String, f32>,\n',
+                  '    media_players: HashMap<String, MediaPlayerState>,\n    media_snapshot_at: HashMap<String, Instant>,\n    media_seek_drafts: HashMap<String, f32>,\n',
+              ),
+              (
+                  '    MediaRefreshTick,\n',
+                  '    MediaRefreshTick,\n    MediaUiTick,\n',
+              ),
+              (
+                  '            self.media_players.remove(group);\n            self.media_seek_drafts.remove(group);\n',
+                  '            self.media_players.remove(group);\n            self.media_snapshot_at.remove(group);\n            self.media_seek_drafts.remove(group);\n',
+              ),
+              (
+                  '            let position = player.position_micros.clamp(0, length);\n',
+                  '            let snapshot_age = self\n                .media_snapshot_at\n                .get(group)\n                .map(Instant::elapsed)\n                .unwrap_or_default();\n            let position = projected_media_position(\n                player.position_micros,\n                length,\n                &player.playback_status,\n                snapshot_age,\n            );\n',
+              ),
+              (
+                  '''        if media_popup_open {\n            Subscription::batch([\n                wayland,\n                cosmic::iced::time::every(MEDIA_REFRESH_INTERVAL)\n                    .map(|_| Message::MediaRefreshTick),\n            ])\n        } else {\n            wayland\n        }\n''',
+                  '''        if media_popup_open {\n            let mut subscriptions = vec![\n                wayland,\n                cosmic::iced::time::every(MEDIA_REFRESH_INTERVAL)\n                    .map(|_| Message::MediaRefreshTick),\n            ];\n            let media_playing = self\n                .popup\n                .active_group()\n                .and_then(|group| self.media_players.get(group))\n                .is_some_and(|player| {\n                    player.playback_status.eq_ignore_ascii_case("playing")\n                        && player.length_micros.is_some_and(|length| length > 0)\n                });\n            if media_playing {\n                subscriptions.push(\n                    cosmic::iced::time::every(MEDIA_UI_TICK_INTERVAL)\n                        .map(|_| Message::MediaUiTick),\n                );\n            }\n            Subscription::batch(subscriptions)\n        } else {\n            wayland\n        }\n''',
+              ),
+              (
+                  '                    self.media_players.clear();\n                    self.media_seek_drafts.clear();\n',
+                  '                    self.media_players.clear();\n                    self.media_snapshot_at.clear();\n                    self.media_seek_drafts.clear();\n',
+              ),
+              (
+                  '                    self.media_players.clear();\n                    self.media_seek_drafts.clear();\n                }\n                self.persist_settings();\n',
+                  '                    self.media_players.clear();\n                    self.media_snapshot_at.clear();\n                    self.media_seek_drafts.clear();\n                }\n                self.persist_settings();\n',
+              ),
+              (
+                  '                self.media_players.clear();\n                self.media_seek_drafts.clear();\n                if reload_preview {\n',
+                  '                self.media_players.clear();\n                self.media_snapshot_at.clear();\n                self.media_seek_drafts.clear();\n                if reload_preview {\n',
+              ),
+              (
+                  '''            Message::MediaLoaded(group, result) => {\n                self.media_seek_drafts.remove(&group);\n                if !self.media_requested() || self.group_count(&group) == 0 {\n                    self.media_players.remove(&group);\n                } else {\n                    match result {\n                        Ok(Some(player)) => {\n                            self.media_players.insert(group, player);\n                        }\n                        Ok(None) => {\n                            self.media_players.remove(&group);\n                        }\n                        Err(error) => {\n                            self.media_players.remove(&group);\n                            tracing::debug!(\n                                ?error,\n                                "mediad unavailable; normal popup remains active"\n                            );\n                        }\n                    }\n                }\n            }\n''',
+                  '''            Message::MediaLoaded(group, result) => {\n                self.media_seek_drafts.remove(&group);\n                self.media_snapshot_at.remove(&group);\n                if !self.media_requested() || self.group_count(&group) == 0 {\n                    self.media_players.remove(&group);\n                } else {\n                    match result {\n                        Ok(Some(player)) => {\n                            self.media_snapshot_at.insert(group.clone(), Instant::now());\n                            self.media_players.insert(group, player);\n                        }\n                        Ok(None) => {\n                            self.media_players.remove(&group);\n                        }\n                        Err(error) => {\n                            self.media_players.remove(&group);\n                            tracing::debug!(\n                                ?error,\n                                "mediad unavailable; normal popup remains active"\n                            );\n                        }\n                    }\n                }\n            }\n''',
+              ),
+              (
+                  '''            Message::MediaRefreshTick => {\n                if self.popup.is_pinned()\n                    && self.media_requested()\n                    && let Some(group) = self.popup.active_group().map(str::to_owned)\n                    && group != SETTINGS_GROUP\n                    && self.group_count(&group) > 0\n                {\n                    return Self::media_status_task(group);\n                }\n            }\n''',
+                  '''            Message::MediaRefreshTick => {\n                if self.popup.is_pinned()\n                    && self.media_requested()\n                    && let Some(group) = self.popup.active_group().map(str::to_owned)\n                    && group != SETTINGS_GROUP\n                    && self.group_count(&group) > 0\n                {\n                    return Self::media_status_task(group);\n                }\n            }\n            Message::MediaUiTick => {}\n''',
+              ),
+              (
+                  '''fn format_media_time(micros: i64) -> String {\n''',
+                  '''fn projected_media_position(\n    position_micros: i64,\n    length_micros: i64,\n    playback_status: &str,\n    snapshot_age: Duration,\n) -> i64 {\n    if length_micros <= 0 {\n        return 0;\n    }\n\n    let mut position = position_micros.clamp(0, length_micros);\n    if playback_status.eq_ignore_ascii_case("playing") {\n        let elapsed_micros = i64::try_from(snapshot_age.as_micros()).unwrap_or(i64::MAX);\n        position = position.saturating_add(elapsed_micros);\n    }\n    position.clamp(0, length_micros)\n}\n\nfn format_media_time(micros: i64) -> String {\n''',
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match, got {count}: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+
+          text += '''\n\n#[cfg(test)]\nmod media_progress_tests {\n    use super::*;\n\n    #[test]\n    fn playing_position_advances_from_snapshot_age() {\n        assert_eq!(\n            projected_media_position(5_000_000, 60_000_000, "Playing", Duration::from_secs(3)),\n            8_000_000\n        );\n    }\n\n    #[test]\n    fn paused_position_does_not_advance() {\n        assert_eq!(\n            projected_media_position(5_000_000, 60_000_000, "Paused", Duration::from_secs(3)),\n            5_000_000\n        );\n    }\n\n    #[test]\n    fn projected_position_clamps_at_track_end() {\n        assert_eq!(\n            projected_media_position(59_000_000, 60_000_000, "Playing", Duration::from_secs(3)),\n            60_000_000\n        );\n    }\n}\n'''
+
+          path.write_text(text)
+          PY
+          rm .github/workflows/patch-media-progress.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs .github/workflows/patch-media-progress.yml
+          git commit -m "fix: interpolate media progress every second"
+          git push origin HEAD:fix/media-progress-tick
