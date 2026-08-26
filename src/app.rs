@@ -34,6 +34,9 @@ const SETTINGS_GROUP: &str = "__tihulu_settings__";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
 const PREVIEW_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(2500);
+const BACKEND_RELOAD_TIMEOUT: Duration = Duration::from_secs(8);
+const PREVIEW_SERVICE: &str = "tihulu-previewd.service";
+const MEDIA_SERVICE: &str = "tihulu-mediad.service";
 const POPUP_WIDTH: f32 = 372.0;
 const POPUP_PADDING: f32 = 12.0;
 const POPUP_MAX_HEIGHT: f32 = 420.0;
@@ -85,6 +88,8 @@ struct MinimizedWindows {
     preview_health_generation: u64,
     media_players: HashMap<String, MediaPlayerState>,
     media_seek_drafts: HashMap<String, f32>,
+    backend_reload_in_progress: bool,
+    backend_reload_status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +110,8 @@ enum Message {
     ToggleMedia(bool),
     TogglePreview(bool),
     ToggleHover(bool),
+    ReloadBackends,
+    BackendsReloaded(Result<(), String>),
     MediaLoaded(String, Result<Option<MediaPlayerState>, String>),
     MediaControl {
         group: String,
@@ -416,6 +423,13 @@ impl MinimizedWindows {
         Task::perform(
             media_client::seek(bus_name, track_id, position_micros),
             move |result| cosmic::Action::App(Message::MediaSeekDone(group, result)),
+        )
+    }
+
+    fn reload_backends_task(reload_preview: bool, reload_media: bool) -> Task<Message> {
+        Task::perform(
+            reload_enabled_backends(reload_preview, reload_media),
+            |result| cosmic::Action::App(Message::BackendsReloaded(result)),
         )
     }
 
@@ -843,6 +857,28 @@ impl MinimizedWindows {
         } else {
             "Preview backend: enabled · tihulu-previewd unavailable or waiting; compact fallback active"
         };
+        let can_reload = !self.settings.mode.safe_core()
+            && (self.settings.media_enabled || self.settings.preview_enabled)
+            && !self.backend_reload_in_progress;
+        let reload_button = cosmic::widget::button::text(if self.backend_reload_in_progress {
+            "Reloading backends…"
+        } else {
+            "Reload backends"
+        });
+        let reload_button = if can_reload {
+            reload_button.on_press(Message::ReloadBackends)
+        } else {
+            reload_button
+        };
+        let reload_note = if self.backend_reload_in_progress {
+            "Backend reload: restarting enabled daemons…".to_owned()
+        } else if let Some(status) = self.backend_reload_status.as_deref() {
+            status.to_owned()
+        } else if self.settings.mode.safe_core() {
+            "Backend reload is unavailable while Safe Core is active.".to_owned()
+        } else {
+            "Reload backends manually if Preview or Media becomes unavailable.".to_owned()
+        };
 
         let content = cosmic::widget::column::with_children(vec![
             title.into(),
@@ -850,11 +886,13 @@ impl MinimizedWindows {
             media.into(),
             preview.into(),
             hover.into(),
+            reload_button.into(),
             cosmic::widget::text(mode_note).width(Length::Fill).into(),
             cosmic::widget::text(media_note).width(Length::Fill).into(),
             cosmic::widget::text(preview_note)
                 .width(Length::Fill)
                 .into(),
+            cosmic::widget::text(reload_note).width(Length::Fill).into(),
         ])
         .spacing(10.0)
         .width(Length::Fill);
@@ -1061,6 +1099,7 @@ impl cosmic::Application for MinimizedWindows {
                 }
             },
             Message::ToggleSafeCore(enabled) => {
+                self.backend_reload_status = None;
                 if enabled {
                     let close_hover_popup = self.popup.is_hover_open();
                     self.settings.mode = FeatureMode::SafeCore;
@@ -1084,6 +1123,7 @@ impl cosmic::Application for MinimizedWindows {
                 self.persist_settings();
             }
             Message::ToggleMedia(enabled) => {
+                self.backend_reload_status = None;
                 self.settings.media_enabled = enabled;
                 if enabled {
                     self.settings.mode = FeatureMode::Extended;
@@ -1094,6 +1134,7 @@ impl cosmic::Application for MinimizedWindows {
                 self.persist_settings();
             }
             Message::TogglePreview(enabled) => {
+                self.backend_reload_status = None;
                 self.settings.preview_enabled = enabled;
                 self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
                 let generation = self.preview_health_generation;
@@ -1108,6 +1149,7 @@ impl cosmic::Application for MinimizedWindows {
                 return Self::clear_preview_task();
             }
             Message::ToggleHover(enabled) => {
+                self.backend_reload_status = None;
                 self.settings.hover_popups = enabled;
                 if enabled {
                     self.settings.mode = FeatureMode::Extended;
@@ -1115,6 +1157,43 @@ impl cosmic::Application for MinimizedWindows {
                 self.persist_settings();
                 if !enabled && self.popup.is_hover_open() {
                     return self.close_popup();
+                }
+            }
+            Message::ReloadBackends => {
+                if self.backend_reload_in_progress || self.settings.mode.safe_core() {
+                    return cosmic::task::none();
+                }
+                let reload_preview = self.preview_requested();
+                let reload_media = self.media_requested();
+                if !reload_preview && !reload_media {
+                    return cosmic::task::none();
+                }
+
+                self.backend_reload_in_progress = true;
+                self.backend_reload_status = None;
+                self.media_players.clear();
+                self.media_seek_drafts.clear();
+                if reload_preview {
+                    self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
+                    self.preview_healthy = false;
+                    self.previews.clear();
+                }
+                return Self::reload_backends_task(reload_preview, reload_media);
+            }
+            Message::BackendsReloaded(result) => {
+                self.backend_reload_in_progress = false;
+                match result {
+                    Ok(()) => {
+                        self.backend_reload_status = Some("Backend reload: complete.".to_owned());
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "manual backend reload failed");
+                        self.backend_reload_status =
+                            Some(format!("Backend reload failed: {error}"));
+                    }
+                }
+                if self.preview_requested() {
+                    return Self::health_check_task(self.preview_health_generation);
                 }
             }
             Message::MediaLoaded(group, result) => {
@@ -1299,6 +1378,45 @@ impl cosmic::Application for MinimizedWindows {
 
     fn on_close_requested(&self, id: WindowId) -> Option<Self::Message> {
         Some(Message::PopupClosed(id))
+    }
+}
+
+async fn reload_enabled_backends(reload_preview: bool, reload_media: bool) -> Result<(), String> {
+    let services = [
+        (reload_preview, PREVIEW_SERVICE),
+        (reload_media, MEDIA_SERVICE),
+    ];
+    let mut errors = Vec::new();
+
+    for (enabled, service) in services {
+        if !enabled {
+            continue;
+        }
+
+        let mut command = tokio::process::Command::new("systemctl");
+        command.args(["--user", "restart", service]);
+        command.kill_on_drop(true);
+
+        match tokio::time::timeout(BACKEND_RELOAD_TIMEOUT, command.output()).await {
+            Err(_) => errors.push(format!("{service}: restart timed out")),
+            Ok(Err(error)) => errors.push(format!("{service}: {error}")),
+            Ok(Ok(output)) if !output.status.success() => {
+                let detail = String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("systemctl restart failed")
+                    .trim()
+                    .to_owned();
+                errors.push(format!("{service}: {detail}"));
+            }
+            Ok(Ok(_)) => {}
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
