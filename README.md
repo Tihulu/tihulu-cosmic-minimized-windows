@@ -1,101 +1,177 @@
-# Tihulu COSMIC Minimized Windows
+# Tihulu Minimized Windows
 
-A stability-first minimized-window applet for COSMIC.
+A stability-first minimized-window applet for the COSMIC desktop, licensed **AGPL-3.0-only**.
 
-## Current v0.4 Safe Core RC
+The project exists because minimized-window preview paths can be dangerous when compositor-side screenshot resources leak. The applet therefore treats window management as the always-available core and makes every future rich feature optional.
 
-The current runtime-validation branch intentionally keeps the panel process small and avoids preview/media work inside `cosmic-panel`.
+## v0.4 Safe Core
 
-Default interaction is **click-only**:
+The v0.4 release-candidate branch intentionally contains **no screenshot or media implementation in the panel applet**.
 
-- single minimized window: click restores it
-- grouped minimized windows: click opens the lightweight title/icon popup
-- right click also opens the grouped popup
-- hover popup creation is **disabled by default**
+It provides:
 
-### Experimental hover popup
+- minimized-toplevel tracking on Wayland
+- grouping by application, including browser aliases
+- one dock/panel icon per group with a window count
+- exact-window restore
+- exact-window close
+- lightweight icon/title group popup
+- click/right-click popup opening by default
+- optional experimental hover opening, disabled by default
+- horizontal and vertical COSMIC panel/dock support
+- a persisted **Safe Core mode** switch
 
-Real COSMIC runtime testing showed repeated hover-triggered popup surface creation can restart `cosmic-panel` on the tested system. For that reason hover is an explicit experimental opt-in and is never the default.
+Safe Core means:
 
-The preference lives in:
+- no screencopy
+- no `wl_shm` thumbnail buffers
+- no preview memfds
+- no image decoding/cache
+- no album art
+- no MPRIS or audio control work
+- no HTTP artwork fetches
+- no preview/media background daemons required for grouping, restore, or close
+
+The default requested mode is Safe Core. Selecting Extended mode only permits optional rich subsystems in future builds; if those subsystems are unavailable or degraded, the applet remains in effective Safe Core operation.
+
+The setting is stored under the user's XDG config directory as:
 
 ```text
 ~/.config/tihulu-cosmic-minimized-windows/config
 ```
 
-Default:
+Default interaction policy is also stored there:
 
 ```ini
 mode=safe-core
 hover-popups=false
 ```
 
-To opt in for testing only, set:
+`hover-popups=true` is an **experimental opt-in**. Real COSMIC runtime testing showed repeated hover-triggered popup surface activity can restart `cosmic-panel`, so click/right-click remains the default. After changing this preference, remove/re-add the applet or restart the panel session so it is read again.
 
-```ini
-mode=safe-core
-hover-popups=true
-```
+## Popup lifetime safety
 
-Then remove/re-add the applet (or restart the panel session) so the setting is read again.
+v0.4 uses an explicit popup state machine instead of loosely coupled popup booleans.
 
-If hover causes panel flicker, popup failures, PID changes, ghost clicks, or a `cosmic-panel` restart, immediately return to `hover-popups=false`.
-
-## Safety model
-
-Safe Core intentionally has no:
-
-- screencopy protocol in the panel process
-- wl_shm preview buffers
-- preview memfd buffers
-- screenshot worker threads
-- image decode/cache
-- MPRIS/media subsystem
-- `pactl` subprocesses
-- HTTP artwork fetching
-
-It keeps:
-
-- minimized toplevel tracking
-- grouping by application, including browser aliases
-- one icon per group with a count
-- exact restore
-- exact close
-- lightweight title/icon popup
-- scrollable multi-window list
-
-## Optional rich architecture
-
-Future rich features stay outside the panel process:
+Logical states are:
 
 ```text
-Tihulu applet
-   |
-   +-- tihulu-previewd  -> bounded thumbnails
-   |
-   +-- tihulu-mediad    -> MPRIS/media controls
+Closed
+HoverOpen(group, window_id, generation)
+Pinned(group, window_id, generation)
 ```
 
-Both daemons are optional. Failure of either must fall back to the click-only Safe Core behavior instead of destabilizing the panel.
+Delayed close requests carry both the popup generation and a close token. A stale timer cannot close a newer popup. A compositor close event for an old `WindowId` is ignored after a newer popup generation has replaced it.
 
-Preview work remains runtime-gated. Media integration is planned as a separate daemon and should begin with text metadata plus play/pause/next/previous, without artwork or polling inside the panel.
+Default click/right-click operation creates pinned popups. The experimental hover path uses the same FSM and serialized popup switching, but is disabled unless `hover-popups=true` is explicitly configured.
 
-## Install this branch/commit
+The FSM has regression tests for stale close timers, compositor close races, pinning, and group switching.
 
-The installer supports a branch, tag, or exact commit SHA through `REF`:
+## Why previews are not in the applet
+
+Historical COSMIC minimize-preview failures included compositor-side `/memfd:minimize-applet-screencopy` growth. Moving the same capture request into another process does not automatically make that compositor-side leak safe.
+
+The planned rich-preview architecture is therefore:
+
+```text
+tihulu-cosmic-minimized-windows
+    lightweight panel UI
+    Safe Core always works
+            |
+            +-- optional IPC --> tihulu-previewd
+            |
+            +-- optional IPC --> tihulu-mediad
+```
+
+The panel applet itself will not own screenshot buffers, MPRIS sessions, PipeWire stream handling, artwork downloads, or rich-image caches.
+
+## Preview safety gate
+
+Before `tihulu-previewd` is integrated, the repository will use a standalone `tihulu-preview-probe` to stress-test COSMIC's newer toplevel image-capture path based on `ext-image-copy-capture` plus a foreign-toplevel capture source.
+
+The probe must show bounded resource behavior during repeated capture. At minimum, testing should record:
+
+- probe FD count
+- probe RSS
+- `cosmic-comp` FD count
+- `cosmic-comp` RSS
+- `cosmic-comp` shared memory when useful
+- relevant compositor memfd counts
+
+A bounded pattern such as `92 -> 93 -> 92 -> 93` is acceptable. Monotonic growth such as `92 -> 93 -> 94 -> 95` means that capture method is rejected and is **not** integrated into the applet.
+
+Even after a capture path passes the probe, a future preview daemon must keep one capture in flight globally, use a bounded thumbnail cache, and contain a circuit breaker that disables capture for the session if resource growth becomes suspicious.
+
+## One-line install
+
+The stable installer remains:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/stable/scripts/quick-install.sh | bash
+```
+
+Then open **COSMIC Settings → Desktop → Dock/Panel**, remove the stock **Minimized Windows** applet, and add **Tihulu Minimized Windows**.
+
+To test the current v0.4 branch directly:
 
 ```bash
 REF=v0.4-safe-core bash <(curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/v0.4-safe-core/scripts/quick-install.sh)
 ```
 
-For runtime acceptance, prefer an exact CI-green SHA rather than a moving branch.
+## Runtime acceptance test
 
-## Runtime acceptance
+CI proves formatting/build/test/lint correctness, not COSMIC runtime stability. Before promotion to stable, test at least:
 
-CI success is not runtime acceptance. Before promotion, test on a real COSMIC session with multiple applications and grouped windows, and observe `cosmic-panel` / `cosmic-comp` PIDs plus FD/RSS/memfd behavior.
+- Brave with 2, 3, 4, and 5 minimized windows
+- repeated default click/right-click popup cycles
+- switching repeatedly between different minimized application groups
+- restore/close cycles
+- two monitors when available
+- logout/login behavior
+- applet FD/RSS
+- all `cosmic-panel` process FD counts and PID stability
+- `cosmic-comp` FD/RSS
 
-A panel PID change during ordinary interaction is a runtime failure even if CI is green.
+Default-off hover must first be verified to create no hover popup surface activity. Experimental `hover-popups=true` testing is a separate opt-in test and any panel PID change, ghost click, popup failure, or restart is a runtime failure; immediately return to `hover-popups=false`.
+
+Useful panel/applet observation:
+
+```bash
+watch -n 2 '
+for pid in $(pgrep -x cosmic-panel); do
+  printf "panel PID=%-8s FD=%s\n" "$pid" "$(ls /proc/$pid/fd 2>/dev/null | wc -l)"
+done
+pid=$(pgrep -f "tihulu-cosmic-minimized-windows" | head -1)
+[ -n "$pid" ] && printf "applet PID=%-8s FD=%s\n" "$pid" "$(ls /proc/$pid/fd 2>/dev/null | wc -l)"
+comp=$(pgrep -x cosmic-comp | head -1)
+[ -n "$comp" ] && printf "comp   PID=%-8s FD=%s\n" "$comp" "$(ls /proc/$comp/fd 2>/dev/null | wc -l)"
+'
+```
+
+The acceptance criterion is simple: the project must not cause monotonically growing FD/memfd/RSS use or `cosmic-panel` PID changes during ordinary click-only operation.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```
+
+The repository pins the COSMIC client-toolkit revision used by the pinned `libcosmic` revision to avoid duplicate/incompatible Wayland protocol types.
+
+Experimental preview/media work belongs on separate branches and PRs. Runtime-untested rich features must not be merged into stable.
 
 ## License
 
-AGPL-3.0-only
+AGPL-3.0-only. See `LICENSE`.
+
+This is a separate implementation for COSMIC interoperability and does not include System76's `cosmic-applet-minimize` source files.
+
+## Related upstream work
+
+- `pop-os/cosmic-applets`
+- `pop-os/cosmic-comp` issue #2073
+- COSMIC foreign-toplevel and image-copy-capture protocols
