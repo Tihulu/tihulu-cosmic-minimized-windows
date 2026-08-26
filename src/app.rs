@@ -72,6 +72,7 @@ enum Message {
     ToggleMedia(bool),
     TogglePreview(bool),
     ToggleHover(bool),
+    Surface(cosmic::surface::Action),
 }
 
 impl MinimizedWindows {
@@ -224,22 +225,29 @@ impl MinimizedWindows {
     }
 
     fn settings_button(&self) -> cosmic::Element<'_, Message> {
-        use cosmic::widget::tooltip::Position;
-
+        // The supplied logo is intentionally full-color/non-symbolic. Constrain
+        // it to the symbolic applet icon box so it cannot increase panel/dock thickness.
         let handle = cosmic::widget::icon::from_name(APP_ID).handle();
+        let size = self.core.applet.suggested_size(true);
+        let logo = cosmic::widget::icon(handle)
+            .width(Length::Fixed(size.0 as f32))
+            .height(Length::Fixed(size.1 as f32));
         let button = self
             .core
             .applet
-            .icon_button_from_handle(handle)
+            .button_from_element(logo, true)
             .on_press_down(Message::OpenSettings);
-        let position = match self.core.applet.anchor {
-            PanelAnchor::Top => Position::Bottom,
-            PanelAnchor::Bottom => Position::Top,
-            PanelAnchor::Left => Position::Right,
-            PanelAnchor::Right => Position::Left,
-        };
 
-        cosmic::widget::tooltip(button, cosmic::widget::text("Settings"), position).into()
+        self.core
+            .applet
+            .applet_tooltip(
+                button,
+                "Tihulu Minimizer Settings",
+                self.popup.is_open(),
+                Message::Surface,
+                None,
+            )
+            .into()
     }
 
     fn popup_anchor_rect(&self, group: &str) -> iced::Rectangle<i32> {
@@ -421,28 +429,38 @@ impl MinimizedWindows {
     }
 
     fn settings_popup_view(&self) -> cosmic::Element<'_, Message> {
-        let title = cosmic::widget::text::title3("Tihulu Minimized Windows");
+        let title = cosmic::widget::text::title3("Tihulu Minimizer Settings");
         let safe_core = cosmic::widget::toggler(self.settings.mode.safe_core())
             .label(Some("Safe Core".to_owned()))
             .on_toggle(Message::ToggleSafeCore)
             .width(Length::Fill);
         let media = cosmic::widget::toggler(self.settings.media_enabled)
-            .label(Some("Media controls".to_owned()))
+            .label(Some("Media".to_owned()))
             .on_toggle(Message::ToggleMedia)
             .width(Length::Fill);
         let preview = cosmic::widget::toggler(self.settings.preview_enabled)
-            .label(Some("Window previews".to_owned()))
+            .label(Some("Preview".to_owned()))
             .on_toggle(Message::TogglePreview)
             .width(Length::Fill);
         let hover = cosmic::widget::toggler(self.settings.hover_popups)
-            .label(Some("Hover popups (experimental)".to_owned()))
+            .label(Some("Hover (experimental)".to_owned()))
             .on_toggle(Message::ToggleHover)
             .width(Length::Fill);
 
-        let note = if self.settings.mode.safe_core() {
-            "Safe Core is active. Media and Preview preferences are kept, but rich subsystems stay inactive until Safe Core is turned off."
+        let mode_note = if self.settings.mode.safe_core() {
+            "Safe Core is active. Media and Preview are suspended; their saved switches are preserved."
         } else {
-            "Extended mode is active. Media and Preview are enabled by default. Their daemon integrations are still being connected on the feature branches."
+            "Safe Core is off. Media and Preview are saved as enabled preferences, but their daemon backends are not connected in this build yet."
+        };
+        let media_note = if self.settings.media_enabled {
+            "Media backend: enabled preference · tihulu-mediad not connected yet"
+        } else {
+            "Media backend: disabled"
+        };
+        let preview_note = if self.settings.preview_enabled {
+            "Preview backend: enabled preference · tihulu-previewd not connected on this branch yet"
+        } else {
+            "Preview backend: disabled"
         };
 
         cosmic::widget::column::with_children(vec![
@@ -451,7 +469,9 @@ impl MinimizedWindows {
             media.into(),
             preview.into(),
             hover.into(),
-            cosmic::widget::text(note).into(),
+            cosmic::widget::text(mode_note).into(),
+            cosmic::widget::text(media_note).into(),
+            cosmic::widget::text(preview_note).into(),
         ])
         .spacing(10.0)
         .width(Length::Fixed(POPUP_WIDTH))
@@ -600,6 +620,11 @@ impl cosmic::Application for MinimizedWindows {
                 if !enabled && self.popup.is_hover_open() {
                     return self.close_popup();
                 }
+            }
+            Message::Surface(action) => {
+                return cosmic::task::message(cosmic::Action::Cosmic(
+                    cosmic::app::Action::Surface(action),
+                ));
             }
         }
 
