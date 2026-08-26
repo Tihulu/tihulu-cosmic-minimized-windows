@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::sync::LazyLock;
-
 use cosmic::iced::window::Id as WindowId;
-
-use crate::config;
-
-// Real COSMIC runtime testing showed repeated hover-triggered popup surface
-// creation can restart cosmic-panel. Hover therefore stays disabled unless the
-// user explicitly opts in with `hover-popups=true` and restarts/re-adds the
-// applet. Click/right-click popup creation is always available.
-static HOVER_POPUPS_ENABLED: LazyLock<bool> = LazyLock::new(config::load_hover_popups);
 
 #[derive(Clone, Debug)]
 struct PopupSession {
@@ -77,17 +67,14 @@ impl PopupFsm {
     }
 
     pub(crate) fn is_pinned(&self) -> bool {
-        // app.rs checks this before issuing a hover-open request. A closed FSM
-        // behaves as hover-blocked while the experimental preference is off.
-        // Explicit click/right-click requests still pass pinned=true directly
-        // into request_open and therefore remain unaffected.
         matches!(self.state, PopupState::Pinned(_))
-            || (!*HOVER_POPUPS_ENABLED && matches!(self.state, PopupState::Closed))
+    }
+
+    pub(crate) fn is_hover_open(&self) -> bool {
+        matches!(self.state, PopupState::HoverOpen(_))
     }
 
     pub(crate) fn group_enter(&mut self, group: String) {
-        // Panel icon and popup are separate Wayland surfaces. Entering one is
-        // authoritative and repairs a missed exit from the other surface.
         self.pointer_in_popup = false;
         self.pointer_group = Some(group);
         self.invalidate_close();
@@ -126,8 +113,6 @@ impl PopupFsm {
         self.invalidate_close();
 
         if self.pending_open.is_some() {
-            // The old popup is already being destroyed. Track only the latest
-            // desired destination and wait for the compositor close ACK.
             self.pending_open = Some(PendingOpen { group, pinned });
             return OpenPlan::None;
         }
@@ -264,11 +249,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_closed_state_blocks_hover_open_call_site() {
-        let mut fsm = PopupFsm::default();
-        fsm.group_enter("brave".into());
-        assert!(fsm.is_pinned());
+    fn closed_state_is_not_pinned_or_open() {
+        let fsm = PopupFsm::default();
+        assert!(!fsm.is_pinned());
         assert!(!fsm.is_open());
+        assert!(!fsm.is_hover_open());
     }
 
     #[test]
@@ -284,6 +269,7 @@ mod tests {
             }
         );
         assert_eq!(fsm.active_group(), Some("brave"));
+        assert!(fsm.is_hover_open());
     }
 
     #[test]
