@@ -33,6 +33,7 @@ const APP_ID: &str = "io.github.tihulu.MinimizedWindows";
 const SETTINGS_GROUP: &str = "__tihulu_settings__";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
 const PREVIEW_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
+const MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(2500);
 const POPUP_WIDTH: f32 = 372.0;
 const POPUP_PADDING: f32 = 12.0;
 const POPUP_MAX_HEIGHT: f32 = 420.0;
@@ -115,8 +116,8 @@ enum Message {
         group: String,
         fraction: f32,
     },
-    MediaSeekCommit(String),
     MediaSeekDone(String, Result<(), String>),
+    MediaRefreshTick,
     PreviewBatchLoaded(Vec<(String, Result<PreviewPayload, String>)>),
     PreviewHealthTick(u64),
     PreviewHealthChecked(u64, Result<(), String>),
@@ -657,29 +658,14 @@ impl MinimizedWindows {
             let display_position =
                 ((display_fraction as f64 * length as f64).round() as i64).clamp(0, length);
 
-            if player.can_seek && player.track_id.is_some() {
-                let changed_group = group.to_owned();
-                children.push(
-                    cosmic::iced::widget::slider(0.0..=1.0, display_fraction, move |fraction| {
-                        Message::MediaSeekChanged {
-                            group: changed_group.clone(),
-                            fraction,
-                        }
-                    })
-                    .step(0.001_f32)
-                    .on_release(Message::MediaSeekCommit(group.to_owned()))
-                    .width(Length::Fill)
-                    .into(),
-                );
-            } else {
-                children.push(
-                    cosmic::iced::widget::progress_bar(0.0..=1.0, display_fraction)
-                        .length(Length::Fill)
-                        .girth(Length::Fixed(4.0))
-                        .into(),
-                );
-            }
             children.push(
+                cosmic::iced::widget::progress_bar(0.0..=1.0, display_fraction)
+                    .length(Length::Fill)
+                    .girth(Length::Fixed(4.0))
+                    .into(),
+            );
+
+            let mut timeline: Vec<cosmic::Element<'a, Message>> = vec![
                 cosmic::widget::text(format!(
                     "{} / {}",
                     format_media_time(display_position),
@@ -687,6 +673,35 @@ impl MinimizedWindows {
                 ))
                 .width(Length::Fill)
                 .into(),
+            ];
+            if player.can_seek && player.track_id.is_some() {
+                let back_position = display_position.saturating_sub(10_000_000);
+                let forward_position = display_position.saturating_add(10_000_000).min(length);
+                let back_fraction = (back_position as f32 / length as f32).clamp(0.0, 1.0);
+                let forward_fraction = (forward_position as f32 / length as f32).clamp(0.0, 1.0);
+                timeline.push(
+                    cosmic::widget::button::text("−10s")
+                        .on_press(Message::MediaSeekChanged {
+                            group: group.to_owned(),
+                            fraction: back_fraction,
+                        })
+                        .into(),
+                );
+                timeline.push(
+                    cosmic::widget::button::text("+10s")
+                        .on_press(Message::MediaSeekChanged {
+                            group: group.to_owned(),
+                            fraction: forward_fraction,
+                        })
+                        .into(),
+                );
+            }
+            children.push(
+                cosmic::widget::row::with_children(timeline)
+                    .spacing(6.0)
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
             );
         }
 
@@ -817,7 +832,7 @@ impl MinimizedWindows {
             "Safe Core is off. Rich features use external daemons and fall back independently when unavailable."
         };
         let media_note = if self.settings.media_enabled {
-            "Media backend: enabled · tihulu-mediad is queried when a click popup opens"
+            "Media backend: enabled · tihulu-mediad is queried while a click popup is open"
         } else {
             "Media backend: disabled"
         };
@@ -923,7 +938,19 @@ impl cosmic::Application for MinimizedWindows {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        wayland::subscription().map(|event| Message::Bridge(Box::new(event)))
+        let wayland = wayland::subscription().map(|event| Message::Bridge(Box::new(event)));
+        let media_popup_open = self.popup.is_pinned()
+            && self.media_requested()
+            && self.popup.active_group() != Some(SETTINGS_GROUP);
+        if media_popup_open {
+            Subscription::batch([
+                wayland,
+                cosmic::iced::time::every(MEDIA_REFRESH_INTERVAL)
+                    .map(|_| Message::MediaRefreshTick),
+            ])
+        } else {
+            wayland
+        }
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
@@ -1130,18 +1157,7 @@ impl cosmic::Application for MinimizedWindows {
                 }
             }
             Message::MediaSeekChanged { group, fraction } => {
-                if self.media_requested()
-                    && self.group_count(&group) > 0
-                    && self
-                        .media_players
-                        .get(&group)
-                        .is_some_and(|player| player.can_seek && player.track_id.is_some())
-                {
-                    self.media_seek_drafts
-                        .insert(group, fraction.clamp(0.0, 1.0));
-                }
-            }
-            Message::MediaSeekCommit(group) => {
+                let fraction = fraction.clamp(0.0, 1.0);
                 if self.media_requested() && self.group_count(&group) > 0 {
                     let request = self.media_players.get(&group).and_then(|player| {
                         let length = player.length_micros.filter(|length| *length > 0)?;
@@ -1149,19 +1165,12 @@ impl cosmic::Application for MinimizedWindows {
                         if !player.can_seek {
                             return None;
                         }
-                        let fraction = self
-                            .media_seek_drafts
-                            .get(&group)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                (player.position_micros as f32 / length as f32).clamp(0.0, 1.0)
-                            })
-                            .clamp(0.0, 1.0);
                         let position =
                             ((fraction as f64 * length as f64).round() as i64).clamp(0, length);
                         Some((player.bus_name.clone(), track_id, position))
                     });
                     if let Some((bus_name, track_id, position)) = request {
+                        self.media_seek_drafts.insert(group.clone(), fraction);
                         return Self::media_seek_task(group, bus_name, track_id, position);
                     }
                 }
@@ -1172,6 +1181,16 @@ impl cosmic::Application for MinimizedWindows {
                     tracing::warn!(?error, "MPRIS seek failed");
                 }
                 if self.media_requested() && self.group_count(&group) > 0 {
+                    return Self::media_status_task(group);
+                }
+            }
+            Message::MediaRefreshTick => {
+                if self.popup.is_pinned()
+                    && self.media_requested()
+                    && let Some(group) = self.popup.active_group().map(str::to_owned)
+                    && group != SETTINGS_GROUP
+                    && self.group_count(&group) > 0
+                {
                     return Self::media_status_task(group);
                 }
             }
