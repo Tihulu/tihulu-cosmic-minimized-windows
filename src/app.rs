@@ -226,17 +226,23 @@ impl MinimizedWindows {
     }
 
     fn settings_button(&self) -> cosmic::Element<'_, Message> {
-        // The supplied logo is intentionally full-color/non-symbolic. Constrain
-        // it to the symbolic applet icon box so it cannot increase panel/dock thickness.
+        // Use the same non-symbolic icon size and padding as normal application
+        // icons such as Spotify. This makes the full-color Tihulu logo visually
+        // match neighboring app icons without requesting a thicker panel/dock.
         let handle = cosmic::widget::icon::from_name(APP_ID).handle();
-        let size = self.core.applet.suggested_size(true);
+        let size = self.core.applet.suggested_size(false);
+        let (major, minor) = self.core.applet.suggested_padding(false);
+        let (px, py) = if self.core.applet.is_horizontal() {
+            (major, minor)
+        } else {
+            (minor, major)
+        };
         let logo = cosmic::widget::icon(handle)
             .width(Length::Fixed(size.0 as f32))
             .height(Length::Fixed(size.1 as f32));
-        let button = self
-            .core
-            .applet
-            .button_from_element(logo, true)
+        let button = cosmic::widget::button::custom(logo)
+            .class(cosmic::theme::Button::AppletIcon)
+            .padding([py as f32, px as f32])
             .on_press_down(Message::OpenSettings);
 
         self.core
@@ -452,9 +458,9 @@ impl MinimizedWindows {
             .width(Length::Fill);
 
         let mode_note = if self.settings.mode.safe_core() {
-            "Safe Core is active. Media and Preview are suspended; their saved switches are preserved."
+            "Safe Core is active. Media, Preview and Hover are off. Enabling any rich option exits Safe Core."
         } else {
-            "Safe Core is off. Media and Preview are saved as enabled preferences, but their daemon backends are not connected in this build yet."
+            "Safe Core is off. Media and Preview are saved preferences, but their daemon backends are not connected in this build yet."
         };
         let media_note = if self.settings.media_enabled {
             "Media backend: enabled preference · tihulu-mediad not connected yet"
@@ -609,23 +615,40 @@ impl cosmic::Application for MinimizedWindows {
                 }
             },
             Message::ToggleSafeCore(enabled) => {
-                self.settings.mode = if enabled {
-                    FeatureMode::SafeCore
+                if enabled {
+                    let close_hover_popup = self.popup.is_hover_open();
+                    self.settings.mode = FeatureMode::SafeCore;
+                    self.settings.media_enabled = false;
+                    self.settings.preview_enabled = false;
+                    self.settings.hover_popups = false;
+                    self.persist_settings();
+                    if close_hover_popup {
+                        return self.close_popup();
+                    }
                 } else {
-                    FeatureMode::Extended
-                };
-                self.persist_settings();
+                    self.settings.mode = FeatureMode::Extended;
+                    self.persist_settings();
+                }
             }
             Message::ToggleMedia(enabled) => {
                 self.settings.media_enabled = enabled;
+                if enabled {
+                    self.settings.mode = FeatureMode::Extended;
+                }
                 self.persist_settings();
             }
             Message::TogglePreview(enabled) => {
                 self.settings.preview_enabled = enabled;
+                if enabled {
+                    self.settings.mode = FeatureMode::Extended;
+                }
                 self.persist_settings();
             }
             Message::ToggleHover(enabled) => {
                 self.settings.hover_popups = enabled;
+                if enabled {
+                    self.settings.mode = FeatureMode::Extended;
+                }
                 self.persist_settings();
                 if !enabled && self.popup.is_hover_open() {
                     return self.close_popup();
