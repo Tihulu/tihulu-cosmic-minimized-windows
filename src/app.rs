@@ -4,7 +4,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     sync::LazyLock,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cctk::toplevel_info::ToplevelInfo;
@@ -34,6 +34,7 @@ const SETTINGS_GROUP: &str = "__tihulu_settings__";
 const LEAVE_GRACE: Duration = Duration::from_millis(650);
 const PREVIEW_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(2500);
+const MEDIA_UI_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const BACKEND_RELOAD_TIMEOUT: Duration = Duration::from_secs(8);
 const PREVIEW_SERVICE: &str = "tihulu-previewd.service";
 const MEDIA_SERVICE: &str = "tihulu-mediad.service";
@@ -87,6 +88,7 @@ struct MinimizedWindows {
     preview_healthy: bool,
     preview_health_generation: u64,
     media_players: HashMap<String, MediaPlayerState>,
+    media_snapshot_at: HashMap<String, Instant>,
     media_seek_drafts: HashMap<String, f32>,
     backend_reload_in_progress: bool,
     backend_reload_status: Option<String>,
@@ -125,6 +127,7 @@ enum Message {
     },
     MediaSeekDone(String, Result<(), String>),
     MediaRefreshTick,
+    MediaUiTick,
     PreviewBatchLoaded(Vec<(String, Result<PreviewPayload, String>)>),
     PreviewHealthTick(u64),
     PreviewHealthChecked(u64, Result<(), String>),
@@ -222,6 +225,7 @@ impl MinimizedWindows {
             && self.group_count(group) == 0
         {
             self.media_players.remove(group);
+            self.media_snapshot_at.remove(group);
             self.media_seek_drafts.remove(group);
         }
         RemovedWindow { group, identifier }
@@ -661,7 +665,17 @@ impl MinimizedWindows {
         }
 
         if let Some(length) = player.length_micros.filter(|length| *length > 0) {
-            let position = player.position_micros.clamp(0, length);
+            let snapshot_age = self
+                .media_snapshot_at
+                .get(group)
+                .map(Instant::elapsed)
+                .unwrap_or_default();
+            let position = projected_media_position(
+                player.position_micros,
+                length,
+                &player.playback_status,
+                snapshot_age,
+            );
             let current_fraction = (position as f32 / length as f32).clamp(0.0, 1.0);
             let display_fraction = self
                 .media_seek_drafts
@@ -981,11 +995,25 @@ impl cosmic::Application for MinimizedWindows {
             && self.media_requested()
             && self.popup.active_group() != Some(SETTINGS_GROUP);
         if media_popup_open {
-            Subscription::batch([
+            let mut subscriptions = vec![
                 wayland,
                 cosmic::iced::time::every(MEDIA_REFRESH_INTERVAL)
                     .map(|_| Message::MediaRefreshTick),
-            ])
+            ];
+            let media_playing = self
+                .popup
+                .active_group()
+                .and_then(|group| self.media_players.get(group))
+                .is_some_and(|player| {
+                    player.playback_status.eq_ignore_ascii_case("playing")
+                        && player.length_micros.is_some_and(|length| length > 0)
+                });
+            if media_playing {
+                subscriptions.push(
+                    cosmic::iced::time::every(MEDIA_UI_TICK_INTERVAL).map(|_| Message::MediaUiTick),
+                );
+            }
+            Subscription::batch(subscriptions)
         } else {
             wayland
         }
@@ -1107,6 +1135,7 @@ impl cosmic::Application for MinimizedWindows {
                     self.settings.preview_enabled = false;
                     self.settings.hover_popups = false;
                     self.media_players.clear();
+                    self.media_snapshot_at.clear();
                     self.media_seek_drafts.clear();
                     self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
                     self.preview_healthy = false;
@@ -1129,6 +1158,7 @@ impl cosmic::Application for MinimizedWindows {
                     self.settings.mode = FeatureMode::Extended;
                 } else {
                     self.media_players.clear();
+                    self.media_snapshot_at.clear();
                     self.media_seek_drafts.clear();
                 }
                 self.persist_settings();
@@ -1172,6 +1202,7 @@ impl cosmic::Application for MinimizedWindows {
                 self.backend_reload_in_progress = true;
                 self.backend_reload_status = None;
                 self.media_players.clear();
+                self.media_snapshot_at.clear();
                 self.media_seek_drafts.clear();
                 if reload_preview {
                     self.preview_health_generation = self.preview_health_generation.wrapping_add(1);
@@ -1198,11 +1229,13 @@ impl cosmic::Application for MinimizedWindows {
             }
             Message::MediaLoaded(group, result) => {
                 self.media_seek_drafts.remove(&group);
+                self.media_snapshot_at.remove(&group);
                 if !self.media_requested() || self.group_count(&group) == 0 {
                     self.media_players.remove(&group);
                 } else {
                     match result {
                         Ok(Some(player)) => {
+                            self.media_snapshot_at.insert(group.clone(), Instant::now());
                             self.media_players.insert(group, player);
                         }
                         Ok(None) => {
@@ -1273,6 +1306,7 @@ impl cosmic::Application for MinimizedWindows {
                     return Self::media_status_task(group);
                 }
             }
+            Message::MediaUiTick => {}
             Message::PreviewBatchLoaded(results) => {
                 for (key, result) in results {
                     match result {
@@ -1459,6 +1493,24 @@ fn normalize_identifier(input: &str) -> String {
         .collect()
 }
 
+fn projected_media_position(
+    position_micros: i64,
+    length_micros: i64,
+    playback_status: &str,
+    snapshot_age: Duration,
+) -> i64 {
+    if length_micros <= 0 {
+        return 0;
+    }
+
+    let mut position = position_micros.clamp(0, length_micros);
+    if playback_status.eq_ignore_ascii_case("playing") {
+        let elapsed_micros = i64::try_from(snapshot_age.as_micros()).unwrap_or(i64::MAX);
+        position = position.saturating_add(elapsed_micros);
+    }
+    position.clamp(0, length_micros)
+}
+
 fn format_media_time(micros: i64) -> String {
     let seconds = (micros.max(0) / 1_000_000) as u64;
     let hours = seconds / 3600;
@@ -1468,5 +1520,34 @@ fn format_media_time(micros: i64) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod media_progress_tests {
+    use super::*;
+
+    #[test]
+    fn playing_position_advances_from_snapshot_age() {
+        assert_eq!(
+            projected_media_position(5_000_000, 60_000_000, "Playing", Duration::from_secs(3)),
+            8_000_000
+        );
+    }
+
+    #[test]
+    fn paused_position_does_not_advance() {
+        assert_eq!(
+            projected_media_position(5_000_000, 60_000_000, "Paused", Duration::from_secs(3)),
+            5_000_000
+        );
+    }
+
+    #[test]
+    fn projected_position_clamps_at_track_end() {
+        assert_eq!(
+            projected_media_position(59_000_000, 60_000_000, "Playing", Duration::from_secs(3)),
+            60_000_000
+        );
     }
 }
