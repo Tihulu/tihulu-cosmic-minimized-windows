@@ -5,6 +5,13 @@
 </p>
 
 <p align="center">
+  <img alt="COSMIC" src="https://img.shields.io/badge/Desktop-COSMIC-6f5bd3?style=flat-square">
+  <img alt="Wayland" src="https://img.shields.io/badge/Session-Wayland-4f7cac?style=flat-square">
+  <img alt="Rust" src="https://img.shields.io/badge/Built%20with-Rust-b7410e?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/License-AGPL--3.0-4c1?style=flat-square">
+</p>
+
+<p align="center">
   <strong>Pop!_OS 24.04 · COSMIC · Wayland</strong>
 </p>
 
@@ -17,31 +24,50 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> ·
+  <a href="#quick-install">Quick Install</a> ·
   <a href="#features">Features</a> ·
+  <a href="#media-controls">Media</a> ·
+  <a href="#live-window-preview">Preview</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#stability-policy">Stability</a>
 </p>
 
-## Install
+## Quick Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/stable/scripts/quick-install.sh | bash
-```
+<table>
+<tr>
+<td>
+<strong>Install from the stable branch</strong><br><br>
 
-Then open **COSMIC Settings → Desktop → Dock/Panel**, remove the stock **Minimized Windows** applet if necessary, and add **Tihulu Minimized Windows**.
+<pre><code>curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/stable/scripts/quick-install.sh | bash</code></pre>
+
+Then open <strong>COSMIC Settings → Desktop → Dock/Panel</strong>, remove the stock <strong>Minimized Windows</strong> applet if necessary, and add <strong>Tihulu Minimized Windows</strong>.
+</td>
+</tr>
+</table>
 
 ## Features
 
-- grouped minimized windows with one panel/dock icon per application
-- exact-window restore and close
-- live minimized-window previews in the click popup
-- media metadata, artwork, playback controls and draggable seek bar
-- per-player volume controls
-- browser volume support through the PipeWire-Pulse app stream when MPRIS volume is ineffective
-- Safe Core compact fallback mode
-- horizontal and vertical COSMIC panel/dock support
-- preview and media work kept outside the `cosmic-panel` process
+<table>
+<tr>
+<td width="50%" valign="top">
+<strong>Window workflow</strong><br><br>
+• grouped minimized windows per application<br>
+• exact-window restore and close<br>
+• live preview in the click popup<br>
+• horizontal and vertical panel/dock support
+</td>
+<td width="50%" valign="top">
+<strong>Rich features without panel bloat</strong><br><br>
+• artwork, playback and draggable seek<br>
+• per-player volume controls<br>
+• browser volume fallback through PipeWire-Pulse<br>
+• Safe Core compact fallback
+</td>
+</tr>
+</table>
+
+Preview and media work stay outside the `cosmic-panel` process.
 
 ## Media controls
 
@@ -72,6 +98,8 @@ Then open **COSMIC Settings → Desktop → Dock/Panel**, remove the stock **Min
 </td>
 </tr>
 </table>
+
+> A real short COSMIC screen recording can be added here later as a demo GIF. The README intentionally avoids generated or reconstructed UI.
 
 ## Settings and backend status
 
