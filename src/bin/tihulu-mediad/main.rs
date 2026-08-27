@@ -81,25 +81,32 @@ fn app_hint_candidates(app_hint: &str) -> Vec<String> {
 }
 
 fn browser_volume_aliases(identity: &str, bus_name: &str) -> Vec<&'static str> {
-    let haystack = normalize(&format!("{identity}{bus_name}"));
     const BROWSERS: &[(&str, &str)] = &[
         ("brave", "brave"),
         ("firefox", "firefox"),
-        ("chromium", "chromium"),
         ("googlechrome", "chrome"),
         ("chrome", "chrome"),
         ("vivaldi", "vivaldi"),
         ("opera", "opera"),
         ("microsoftedge", "edge"),
         ("msedge", "edge"),
+        ("chromium", "chromium"),
     ];
-    let mut aliases = Vec::new();
-    for (needle, alias) in BROWSERS {
-        if haystack.contains(needle) && !aliases.contains(alias) {
-            aliases.push(*alias);
-        }
+
+    let identity = normalize(identity);
+    if let Some((_, alias)) = BROWSERS
+        .iter()
+        .find(|(needle, _)| identity.contains(needle))
+    {
+        return vec![*alias];
     }
-    aliases
+
+    let bus_name = normalize(bus_name);
+    BROWSERS
+        .iter()
+        .find(|(needle, _)| bus_name.contains(needle))
+        .map(|(_, alias)| vec![*alias])
+        .unwrap_or_default()
 }
 
 fn sink_input_index(stream: &Value) -> Option<String> {
@@ -849,8 +856,7 @@ mod tests {
     fn brave_player_gets_browser_volume_aliases() {
         let aliases =
             browser_volume_aliases("Brave", "org.mpris.MediaPlayer2.chromium.instance1234");
-        assert!(aliases.contains(&"brave"));
-        assert!(aliases.contains(&"chromium"));
+        assert_eq!(aliases, vec!["brave"]);
     }
 
     #[test]
