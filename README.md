@@ -1,16 +1,37 @@
 # Tihulu Minimized Windows
 
-A stability-first minimized-window applet for the **COSMIC desktop**.
-
-It keeps the normal minimized-window workflow lightweight while adding optional live previews and media controls through isolated helper daemons.
-
-**Target environment:** Pop!_OS 24.04 · COSMIC · Wayland
-
 <p align="center">
-  <img src="docs/screenshots/media-popup.webp" alt="Tihulu Minimized Windows rich media popup" width="420">
+  A stability-first minimized-window applet for the <strong>COSMIC desktop</strong>.
 </p>
 
-## Highlights
+<p align="center">
+  <strong>Pop!_OS 24.04 · COSMIC · Wayland</strong>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/media-popup.webp" alt="Tihulu Minimized Windows rich media popup" width="720">
+</p>
+
+<p align="center">
+  Lightweight minimized-window handling with optional live previews and media controls through isolated helper daemons.
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#stability-policy">Stability</a>
+</p>
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/stable/scripts/quick-install.sh | bash
+```
+
+Then open **COSMIC Settings → Desktop → Dock/Panel**, remove the stock **Minimized Windows** applet if necessary, and add **Tihulu Minimized Windows**.
+
+## Features
 
 - grouped minimized windows with one panel/dock icon per application
 - exact-window restore and close
@@ -18,46 +39,49 @@ It keeps the normal minimized-window workflow lightweight while adding optional 
 - media metadata, artwork, playback controls and draggable seek bar
 - per-player volume controls
 - browser volume support through the PipeWire-Pulse app stream when MPRIS volume is ineffective
-- Safe Core fallback mode
-- manual **Reload backends** recovery
+- Safe Core compact fallback mode
 - horizontal and vertical COSMIC panel/dock support
-- rich preview/media work kept outside the `cosmic-panel` process
+- preview and media work kept outside the `cosmic-panel` process
 
-## Screenshots
+### Media controls
 
-<table>
-<tr>
-<td width="50%" align="center">
-  <img src="docs/screenshots/preview-popup.webp" alt="Live minimized-window preview popup" width="360"><br>
-  <strong>Live window preview</strong><br>
-  A captured preview of the exact minimized window, shown only in the click/pinned popup.
-</td>
-<td width="50%" align="center">
-  <img src="docs/screenshots/safe-core.webp" alt="Safe Core compact minimized-window popup" width="420"><br>
-  <strong>Safe Core</strong><br>
-  A compact icon/title popup when rich preview and media features are disabled or unavailable.
-</td>
-</tr>
-</table>
+<p align="center">
+  <img src="docs/screenshots/media-popup.webp" alt="Media controls with artwork, playback, seek and volume" width="700">
+</p>
+
+Media integration runs in `tihulu-mediad`, keeping MPRIS/D-Bus and browser audio-stream handling outside the panel process.
+
+### Live window preview
+
+<p align="center">
+  <img src="docs/screenshots/preview-popup.webp" alt="Live minimized-window preview popup" width="700">
+</p>
+
+The click popup can show a captured preview of the exact minimized window before you restore it. Preview capture runs in `tihulu-previewd`; if capture is unavailable for one window, that window falls back compactly without breaking the rest of the popup.
 
 ### Settings and backend status
 
 <p align="center">
-  <img src="docs/screenshots/settings.webp" alt="Tihulu Minimizer settings" width="380">
+  <img src="docs/screenshots/settings.webp" alt="Tihulu Minimizer settings" width="520">
 </p>
 
-The settings popup exposes Safe Core, Media, Preview and the experimental Hover option, plus backend health and manual reload status.
-
-## Default settings
+The settings popup exposes Safe Core, Media and Preview controls together with backend health information.
 
 Clean installs use:
 
 - **Safe Core:** OFF
 - **Media:** ON
 - **Preview:** ON
-- **Hover:** OFF
 
-Hover remains experimental and disabled by default. The normal interaction model is click/right-click with a pinned popup.
+The normal interaction model is click/right-click with a pinned popup; there is no hover-preview path.
+
+### Safe Core
+
+<p align="center">
+  <img src="docs/screenshots/safe-core.webp" alt="Safe Core compact minimized-window popup" width="680">
+</p>
+
+Safe Core keeps the popup compact when rich preview/media features are disabled or unavailable, while normal window restore and close remain available.
 
 ## Architecture
 
@@ -72,17 +96,9 @@ tihulu-cosmic-minimized-windows
             +-- IPC --> tihulu-mediad
 ```
 
-`tihulu-previewd` owns preview capture work. `tihulu-mediad` owns MPRIS/D-Bus media integration and browser audio-stream volume handling. The panel process itself does not perform MPRIS or PipeWire/Pulse audio control work.
+`tihulu-previewd` owns preview capture work. `tihulu-mediad` owns MPRIS/D-Bus media integration and browser audio-stream volume handling. The panel process itself does not perform MPRIS or PipeWire/Pulse audio-control work.
 
 If either optional backend is unavailable, the affected rich feature falls back independently instead of breaking the normal minimized-window popup.
-
-## One-line install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Tihulu/tihulu-cosmic-minimized-windows/stable/scripts/quick-install.sh | bash
-```
-
-Then open **COSMIC Settings → Desktop → Dock/Panel**, remove the stock **Minimized Windows** applet if necessary, and add **Tihulu Minimized Windows**.
 
 ## Requirements
 
@@ -105,7 +121,6 @@ In particular:
 - preview failure falls back only for the affected window
 - media-daemon failure hides media controls without breaking the window popup
 - preview/media helpers use bounded IPC/resource behavior
-- Hover stays OFF by default because earlier hover-popup testing could restart `cosmic-panel`
 
 ## Development
 
