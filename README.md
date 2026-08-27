@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/media-popup.webp" alt="Tihulu Minimized Windows rich media popup" width="720">
+  <img src="docs/screenshots/media-popup.webp" alt="Tihulu Minimized Windows rich media popup" width="560">
 </p>
 
 <p align="center">
@@ -43,45 +43,67 @@ Then open **COSMIC Settings → Desktop → Dock/Panel**, remove the stock **Min
 - horizontal and vertical COSMIC panel/dock support
 - preview and media work kept outside the `cosmic-panel` process
 
-### Media controls
+## Media controls
 
-<p align="center">
-  <img src="docs/screenshots/media-popup.webp" alt="Media controls with artwork, playback, seek and volume" width="700">
-</p>
+<table>
+<tr>
+<td width="58%" align="center" valign="middle">
+  <img src="docs/screenshots/media-popup.webp" alt="Media controls with artwork, playback, seek and volume" width="500">
+</td>
+<td width="42%" valign="middle">
+  <strong>Media without making the panel heavy</strong><br><br>
+  Artwork, playback actions, seek and per-player volume are available directly from the click popup.<br><br>
+  Media integration runs in <code>tihulu-mediad</code>, keeping MPRIS/D-Bus and browser audio-stream handling outside <code>cosmic-panel</code>.
+</td>
+</tr>
+</table>
 
-Media integration runs in `tihulu-mediad`, keeping MPRIS/D-Bus and browser audio-stream handling outside the panel process.
+## Live window preview
 
-### Live window preview
+<table>
+<tr>
+<td width="42%" valign="middle">
+  <strong>Know which window you are restoring</strong><br><br>
+  The popup can show a captured preview of the exact minimized window before you restore it.<br><br>
+  Capture runs in <code>tihulu-previewd</code>. If preview is unavailable for one window, only that window falls back compactly.
+</td>
+<td width="58%" align="center" valign="middle">
+  <img src="docs/screenshots/preview-popup.webp" alt="Live minimized-window preview popup" width="500">
+</td>
+</tr>
+</table>
 
-<p align="center">
-  <img src="docs/screenshots/preview-popup.webp" alt="Live minimized-window preview popup" width="700">
-</p>
+## Settings and backend status
 
-The click popup can show a captured preview of the exact minimized window before you restore it. Preview capture runs in `tihulu-previewd`; if capture is unavailable for one window, that window falls back compactly without breaking the rest of the popup.
+<table>
+<tr>
+<td width="52%" align="center" valign="middle">
+  <img src="docs/screenshots/settings.webp" alt="Tihulu Minimizer settings" width="430">
+</td>
+<td width="48%" valign="middle">
+  <strong>Simple defaults</strong><br><br>
+  <strong>Safe Core:</strong> OFF<br>
+  <strong>Media:</strong> ON<br>
+  <strong>Preview:</strong> ON<br><br>
+  Backend state is visible from the settings popup. The normal interaction model is click/right-click with a pinned popup; there is no hover-preview path.
+</td>
+</tr>
+</table>
 
-### Settings and backend status
+## Safe Core
 
-<p align="center">
-  <img src="docs/screenshots/settings.webp" alt="Tihulu Minimizer settings" width="520">
-</p>
-
-The settings popup exposes Safe Core, Media and Preview controls together with backend health information.
-
-Clean installs use:
-
-- **Safe Core:** OFF
-- **Media:** ON
-- **Preview:** ON
-
-The normal interaction model is click/right-click with a pinned popup; there is no hover-preview path.
-
-### Safe Core
-
-<p align="center">
-  <img src="docs/screenshots/safe-core.webp" alt="Safe Core compact minimized-window popup" width="680">
-</p>
-
-Safe Core keeps the popup compact when rich preview/media features are disabled or unavailable, while normal window restore and close remain available.
+<table>
+<tr>
+<td width="42%" valign="middle">
+  <strong>Compact fallback when rich features are unavailable</strong><br><br>
+  Safe Core keeps normal window restore and close available without depending on preview or media helpers.<br><br>
+  A failure in one optional backend does not break the normal minimized-window popup.
+</td>
+<td width="58%" align="center" valign="middle">
+  <img src="docs/screenshots/safe-core.webp" alt="Safe Core compact minimized-window popup" width="500">
+</td>
+</tr>
+</table>
 
 ## Architecture
 
