@@ -18,6 +18,7 @@ use media_ipc::{
     MEDIA_PROTOCOL_VERSION, MediaAction, MediaPlayerState, MediaRequest, MediaResponse,
     media_socket_path,
 };
+use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -34,6 +35,8 @@ const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 const MPRIS_ROOT: &str = "org.mpris.MediaPlayer2";
 const MPRIS_PLAYER: &str = "org.mpris.MediaPlayer2.Player";
 const VOLUME_STEP: f64 = 0.05;
+const PULSE_VOLUME_NORMAL: f64 = 65_536.0;
+const PACTL_TIMEOUT: Duration = Duration::from_millis(900);
 const MAX_ARTWORK_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ARTWORK_CACHE_ENTRIES: usize = 12;
 const ARTWORK_FAILURE_TTL: Duration = Duration::from_secs(60);
@@ -75,6 +78,188 @@ fn app_hint_candidates(app_hint: &str) -> Vec<String> {
         }
     }
     candidates
+}
+
+fn browser_volume_aliases(identity: &str, bus_name: &str) -> Vec<&'static str> {
+    const BROWSERS: &[(&str, &str)] = &[
+        ("brave", "brave"),
+        ("firefox", "firefox"),
+        ("googlechrome", "chrome"),
+        ("chrome", "chrome"),
+        ("vivaldi", "vivaldi"),
+        ("opera", "opera"),
+        ("microsoftedge", "edge"),
+        ("msedge", "edge"),
+        ("chromium", "chromium"),
+    ];
+
+    let identity = normalize(identity);
+    if let Some((_, alias)) = BROWSERS
+        .iter()
+        .find(|(needle, _)| identity.contains(needle))
+    {
+        return vec![*alias];
+    }
+
+    let bus_name = normalize(bus_name);
+    BROWSERS
+        .iter()
+        .find(|(needle, _)| bus_name.contains(needle))
+        .map(|(_, alias)| vec![*alias])
+        .unwrap_or_default()
+}
+
+fn sink_input_index(stream: &Value) -> Option<String> {
+    stream
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index.to_string())
+        .or_else(|| {
+            stream
+                .get("index")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn channel_volume_fraction(channel: &Value) -> Option<f64> {
+    channel
+        .get("value")
+        .and_then(Value::as_f64)
+        .map(|value| value / PULSE_VOLUME_NORMAL)
+        .or_else(|| {
+            channel
+                .get("value_percent")
+                .and_then(Value::as_str)
+                .and_then(|value| value.trim_end_matches('%').trim().parse::<f64>().ok())
+                .map(|percent| percent / 100.0)
+        })
+        .filter(|value| value.is_finite())
+}
+
+fn sink_input_volume_fraction(stream: &Value) -> Option<f64> {
+    let channels = stream.get("volume")?.as_object()?;
+    let volumes = channels
+        .values()
+        .filter_map(channel_volume_fraction)
+        .collect::<Vec<_>>();
+    if volumes.is_empty() {
+        return None;
+    }
+    Some((volumes.iter().sum::<f64>() / volumes.len() as f64).clamp(0.0, 1.0))
+}
+
+fn sink_input_matches(stream: &Value, aliases: &[&str]) -> bool {
+    if aliases.is_empty() {
+        return false;
+    }
+    let Some(properties) = stream.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    const KEYS: &[&str] = &[
+        "application.name",
+        "application.process.binary",
+        "application.icon_name",
+        "media.name",
+    ];
+    let haystack = KEYS
+        .iter()
+        .filter_map(|key| properties.get(*key).and_then(Value::as_str))
+        .map(normalize)
+        .collect::<Vec<_>>()
+        .join("");
+    aliases.iter().any(|alias| haystack.contains(alias))
+}
+
+fn matching_sink_inputs(inputs: &[Value], aliases: &[&str]) -> Vec<(String, f64)> {
+    inputs
+        .iter()
+        .filter(|stream| sink_input_matches(stream, aliases))
+        .filter_map(|stream| {
+            Some((
+                sink_input_index(stream)?,
+                sink_input_volume_fraction(stream)?,
+            ))
+        })
+        .collect()
+}
+
+async fn pactl_sink_inputs() -> Result<Vec<Value>, String> {
+    let mut command = Command::new("pactl");
+    command
+        .args(["-f", "json", "list", "sink-inputs"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(PACTL_TIMEOUT, command.output())
+        .await
+        .map_err(|_| "pactl sink-input query timed out".to_owned())?
+        .map_err(|error| format!("pactl sink-input query failed: {error}"))?;
+    if !output.status.success() {
+        return Err("pactl sink-input query returned failure".to_owned());
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("pactl JSON decode failed: {error}"))?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "pactl sink-input response was not an array".to_owned())
+}
+
+async fn browser_stream_volume(identity: &str, bus_name: &str) -> Option<f64> {
+    let aliases = browser_volume_aliases(identity, bus_name);
+    if aliases.is_empty() {
+        return None;
+    }
+    let inputs = pactl_sink_inputs().await.ok()?;
+    let matching = matching_sink_inputs(&inputs, &aliases);
+    if matching.is_empty() {
+        return None;
+    }
+    Some(matching.iter().map(|(_, volume)| *volume).sum::<f64>() / matching.len() as f64)
+}
+
+async fn set_sink_input_volume(index: &str, target: f64) -> Result<(), String> {
+    let target = format!("{:.0}%", target.clamp(0.0, 1.0) * 100.0);
+    let mut command = Command::new("pactl");
+    command
+        .args(["set-sink-input-volume", index, &target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(PACTL_TIMEOUT, command.status())
+        .await
+        .map_err(|_| "pactl volume update timed out".to_owned())?
+        .map_err(|error| format!("pactl volume update failed: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("pactl volume update returned failure".to_owned())
+    }
+}
+
+async fn adjust_browser_stream_volume(
+    identity: &str,
+    bus_name: &str,
+    delta: f64,
+) -> Result<(), String> {
+    let aliases = browser_volume_aliases(identity, bus_name);
+    if aliases.is_empty() {
+        return Err("not a browser media player".to_owned());
+    }
+    let inputs = pactl_sink_inputs().await?;
+    let matching = matching_sink_inputs(&inputs, &aliases);
+    if matching.is_empty() {
+        return Err("no matching browser audio stream found".to_owned());
+    }
+    let current = matching.iter().map(|(_, volume)| *volume).sum::<f64>() / matching.len() as f64;
+    let target = (current + delta).clamp(0.0, 1.0);
+    for (index, _) in matching {
+        set_sink_input_volume(&index, target).await?;
+    }
+    Ok(())
 }
 
 fn integer_micros(value: &OwnedValue) -> Option<i64> {
@@ -302,11 +487,18 @@ async fn read_player_raw(
         .and_then(integer_micros)
         .unwrap_or(0)
         .max(0);
-    let volume = player
+    let mpris_volume = player
         .get_property::<f64>("Volume")
         .await
         .ok()
         .filter(|value| value.is_finite());
+    let volume = if browser_volume_aliases(&identity, bus_name).is_empty() {
+        mpris_volume
+    } else {
+        browser_stream_volume(&identity, bus_name)
+            .await
+            .or(mpris_volume)
+    };
     let can_previous: bool = player.get_property("CanGoPrevious").await.unwrap_or(false);
     let can_next: bool = player.get_property("CanGoNext").await.unwrap_or(false);
     let can_play: bool = player.get_property("CanPlay").await.unwrap_or(false);
@@ -391,7 +583,20 @@ async fn find_player(
     }
 }
 
-async fn adjust_volume(player: &Proxy<'_>, delta: f64) -> Result<(), String> {
+async fn adjust_volume(
+    player: &Proxy<'_>,
+    identity: &str,
+    bus_name: &str,
+    delta: f64,
+) -> Result<(), String> {
+    if !browser_volume_aliases(identity, bus_name).is_empty()
+        && adjust_browser_stream_volume(identity, bus_name, delta)
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
+
     let current: f64 = player
         .get_property("Volume")
         .await
@@ -401,6 +606,15 @@ async fn adjust_volume(player: &Proxy<'_>, delta: f64) -> Result<(), String> {
         .set_property("Volume", target)
         .await
         .map_err(|error| format!("MPRIS Volume write failed: {error}"))
+}
+
+async fn player_identity(connection: &Connection, bus_name: &str) -> String {
+    let Ok(root) = Proxy::new(connection, bus_name, MPRIS_PATH, MPRIS_ROOT).await else {
+        return bus_name.to_owned();
+    };
+    root.get_property("Identity")
+        .await
+        .unwrap_or_else(|_| bus_name.to_owned())
 }
 
 async fn control_player(
@@ -434,8 +648,14 @@ async fn control_player(
                 .await
                 .map_err(|error| format!("MPRIS Next failed: {error}"))?;
         }
-        MediaAction::VolumeDown => adjust_volume(&player, -VOLUME_STEP).await?,
-        MediaAction::VolumeUp => adjust_volume(&player, VOLUME_STEP).await?,
+        MediaAction::VolumeDown => {
+            let identity = player_identity(connection, bus_name).await;
+            adjust_volume(&player, &identity, bus_name, -VOLUME_STEP).await?;
+        }
+        MediaAction::VolumeUp => {
+            let identity = player_identity(connection, bus_name).await;
+            adjust_volume(&player, &identity, bus_name, VOLUME_STEP).await?;
+        }
     }
     Ok(())
 }
@@ -615,7 +835,9 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_hint_candidates, artwork_extension};
+    use super::{
+        app_hint_candidates, artwork_extension, browser_volume_aliases, matching_sink_inputs,
+    };
     use std::fs;
 
     #[test]
@@ -628,6 +850,32 @@ mod tests {
     fn browser_group_keys_keep_specific_player_matching() {
         assert_eq!(app_hint_candidates("browser:brave"), vec!["brave"]);
         assert_eq!(app_hint_candidates("browser:firefox"), vec!["firefox"]);
+    }
+
+    #[test]
+    fn brave_player_gets_browser_volume_aliases() {
+        let aliases =
+            browser_volume_aliases("Brave", "org.mpris.MediaPlayer2.chromium.instance1234");
+        assert_eq!(aliases, vec!["brave"]);
+    }
+
+    #[test]
+    fn pactl_sink_input_matching_reads_browser_volume() {
+        let stream = serde_json::json!({
+            "index": 42,
+            "volume": {
+                "front-left": {"value": 32768},
+                "front-right": {"value_percent": "50%"}
+            },
+            "properties": {
+                "application.name": "Brave",
+                "application.process.binary": "brave"
+            }
+        });
+        let matches = matching_sink_inputs(&[stream], &["brave"]);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "42");
+        assert!((matches[0].1 - 0.5).abs() < 0.000_001);
     }
 
     #[test]
